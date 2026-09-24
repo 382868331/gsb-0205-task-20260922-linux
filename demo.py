@@ -10,7 +10,10 @@ nothing sleeps) and prints:
   B. a larger deterministically generated instance with search-state counters;
   C. two boundary cases the contract actually triggers:
        - a locatable input rejection (NaN allele), plus a bool-vs-int one;
-       - search-budget exhaustion, kept distinct from infeasibility.
+       - search-budget exhaustion, kept distinct from infeasibility;
+  D. the explicit-ploidy entry (ploidy 3 and 2): a normal result with
+     per-copy assignments, a tie resolved by canonical haplotype ordering,
+     and an actual rejection of ploidy=4.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from haplophase import (
     Observation,
     SearchBudgetExhaustedError,
     phase_haplotypes,
+    phase_polyploid,
 )
 
 
@@ -167,6 +171,76 @@ def main() -> None:
         )
         print("  (every validated instance is feasible, so this is not a "
               "'no solution' verdict: rerun without max_nodes to prove it.)")
+
+    # ------------------------------------------------------------------ D
+    show("D. Explicit ploidy 3: three error-free clusters plus one noisy read")
+    observations_d = [
+        Observation((0, 0, 1, None), 2),   # cluster of copy 001-
+        Observation((0, 0, 1, 0), 1),
+        Observation((1, 1, 0, None), 3),   # cluster of copy 110-
+        Observation((None, 1, 0, 1), 1),
+        Observation((0, 1, 1, None), 1),   # cluster of copy 011-
+        Observation((0, 0, 0, 0), 1),      # noisy read: pays one flip anywhere
+        Observation((None, None, None, None), 7),  # all missing: neutral
+    ]
+    t0 = time.perf_counter()
+    result_d = phase_polyploid(4, observations_d, ploidy=3)
+    dt = time.perf_counter() - t0
+    print("ploidy              :", result_d.ploidy)
+    for c, h in enumerate(result_d.haplotypes):
+        print(f"copy {c}              : {''.join(map(str, h))}")
+    print(f"optimal total cost  : {result_d.optimal_cost}")
+    print(
+        "second-best gap     : "
+        + (
+            f"next distinct solution costs {result_d.second_best_cost} "
+            f"(gap = {result_d.gap})"
+            if result_d.gap is not None
+            else "none - every admissible solution is optimal"
+        )
+    )
+    print(f"optimal solutions   : {len(result_d.optimal_solutions)}")
+    print(f"candidates evaluated: {result_d.candidates_evaluated} "
+          "(complete enumeration, no budget needed)")
+    print("per-read assignment (-> copy index, = marks a tie):")
+    for a in result_d.assignments:
+        mark = " =TIED" if a.tied else ""
+        flips = (
+            "no flip"
+            if not a.flips_applied
+            else "flip locus " + ", ".join(str(k + 1) for k in a.flips_applied)
+        )
+        print(
+            f"  read {a.index}: -> copy {a.assigned}{mark}  "
+            f"costs {list(a.costs)}  ({flips})"
+        )
+    print(f"computed in {dt * 1000:.1f} ms (exact integer arithmetic)")
+
+    show("D2. Ploidy 2 with a tie: canonical order picks the smaller solution")
+    result_d2 = phase_polyploid(
+        2,
+        [
+            Observation((0, 0), 5),
+            Observation((0, 1), 1),
+            Observation((1, 1), 1),
+        ],
+        ploidy=2,
+    )
+    print("optimal solutions   : " + ", ".join(
+        "{" + ", ".join("".join(map(str, h)) for h in sol) + "}"
+        for sol in result_d2.optimal_solutions
+    ))
+    print("canonical haplotypes: "
+          + ", ".join("".join(map(str, h)) for h in result_d2.haplotypes))
+    print(f"optimal cost {result_d2.optimal_cost}, "
+          f"second best {result_d2.second_best_cost} "
+          f"(gap {result_d2.gap})")
+
+    show("D3. Rejected boundary: ploidy outside {2, 3} is a locatable error")
+    try:
+        phase_polyploid(2, [Observation((0, 0), 1)], ploidy=4)
+    except InvalidPhasingInputError as err:
+        print(f"raised {type(err).__name__}: {err}")
 
     print()
     print("demo finished.")

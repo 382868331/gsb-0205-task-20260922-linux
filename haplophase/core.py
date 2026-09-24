@@ -1,4 +1,4 @@
-"""Cross-fragment diploid haplotype phasing (weighted MEC) via branch and bound.
+"""Cross-fragment haplotype phasing (weighted MEC).
 
 Public API
 ----------
@@ -7,7 +7,13 @@ Observation
     entries are 0, 1 or None (missing); ``flip_cost`` is the positive integer
     cost of flipping *one* observed allele in that read.
 phase_haplotypes(loci, observations, *, max_nodes=None) -> PhasingResult
-    Exact weighted minimum-error-correction phasing.
+    Exact weighted minimum-error-correction diploid phasing via branch and
+    bound (up to 18 loci / 200 reads).
+phase_polyploid(loci, observations, *, ploidy) -> PolyploidPhasingResult
+    Exact phasing with an explicit copy number of 2 or 3 (up to 6 loci /
+    8 reads). Each read is assigned to the single copy with the fewest
+    mismatches; the complete canonical candidate space is enumerated, so
+    there is no search budget and no budget-exhaustion state.
 
 All arithmetic is exact integer arithmetic; the package never uses floating
 point for costs.
@@ -17,6 +23,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from itertools import combinations_with_replacement
 from typing import Optional, Sequence
 
 __all__ = [
@@ -24,16 +31,26 @@ __all__ = [
     "PhasingResult",
     "ReadAssignment",
     "SearchStats",
+    "PolyploidPhasingResult",
+    "CopyAssignment",
     "PhasingError",
     "InvalidPhasingInputError",
     "SearchBudgetExhaustedError",
     "phase_haplotypes",
+    "phase_polyploid",
     "MAX_LOCI",
     "MAX_OBSERVATIONS",
+    "POLYPLOID_MAX_LOCI",
+    "POLYPLOID_MAX_OBSERVATIONS",
+    "POLYPLOID_PLOIDIES",
 ]
 
 MAX_LOCI = 18
 MAX_OBSERVATIONS = 200
+
+POLYPLOID_MAX_LOCI = 6
+POLYPLOID_MAX_OBSERVATIONS = 8
+POLYPLOID_PLOIDIES = (2, 3)
 
 _H0 = 0  # label of the reported haplotype h
 _H1 = 1  # label of the complement 1-h
@@ -160,6 +177,58 @@ class PhasingResult:
     search: SearchStats
 
 
+@dataclass(frozen=True)
+class CopyAssignment:
+    """Assignment of one read to the cheapest copy of a polyploid solution.
+
+    assigned: 0-based index of the chosen copy. When ``tied`` is True several
+              copies attain the minimum cost and ``assigned`` holds the
+              deterministic tie-break (the lowest such index).
+    tied: True iff more than one copy attains the minimum cost.
+    costs: exact weighted mismatch cost of this read against every copy.
+    flips: per copy, the 0-based loci whose alleles would have to be flipped.
+    flips_applied: the flip set of the assigned copy.
+    """
+
+    index: int
+    assigned: int
+    tied: bool
+    costs: tuple[int, ...]
+    flips: tuple[tuple[int, ...], ...]
+    flips_applied: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class PolyploidPhasingResult:
+    """Exact phasing result for an explicit copy number of 2 or 3.
+
+    haplotypes: canonical optimal solution — the lexicographically smallest
+        sorted tuple of copy haplotypes among all optimal solutions.
+    optimal_solutions: every distinct optimal solution, each represented as a
+        sorted tuple of copy haplotypes, the whole list sorted
+        lexicographically. Copies are interchangeable, so each unordered
+        multiset of copies appears exactly once; copies may be identical.
+    optimal_cost / second_best_cost: smallest total cost and the smallest
+        cost of any strictly worse solution (None if every admissible
+        solution is optimal).
+    gap: second_best_cost - optimal_cost, or None. Costs are integers, so
+        when present gap >= 1.
+    assignments: per-read assignment for the canonical ``haplotypes``.
+    candidates_evaluated: number of canonical candidate solutions enumerated
+        (the search is a complete enumeration, so this equals the size of
+        the candidate space C(2**loci + ploidy - 1, ploidy)).
+    """
+
+    ploidy: int
+    haplotypes: tuple[tuple[int, ...], ...]
+    optimal_solutions: tuple[tuple[tuple[int, ...], ...], ...]
+    optimal_cost: int
+    second_best_cost: Optional[int]
+    gap: Optional[int]
+    assignments: tuple[CopyAssignment, ...]
+    candidates_evaluated: int
+
+
 def _is_plain_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -168,15 +237,18 @@ def _validate_inputs(
     loci: object,
     observations: object,
     max_nodes: object,
+    *,
+    max_loci: int = MAX_LOCI,
+    max_observations: int = MAX_OBSERVATIONS,
 ) -> tuple[int, list[Observation]]:
     if not _is_plain_int(loci):
         kind = "bool" if isinstance(loci, bool) else type(loci).__name__
         raise InvalidPhasingInputError(
             f"loci: expected int, got {kind}; bool is not accepted"
         )
-    if not 1 <= loci <= MAX_LOCI:
+    if not 1 <= loci <= max_loci:
         raise InvalidPhasingInputError(
-            f"loci: must satisfy 1 <= loci <= {MAX_LOCI}, got {loci}"
+            f"loci: must satisfy 1 <= loci <= {max_loci}, got {loci}"
         )
 
     if max_nodes is not None:
@@ -195,9 +267,10 @@ def _validate_inputs(
             "observations: expected a list or tuple of Observation, got "
             + type(observations).__name__
         )
-    if len(observations) > MAX_OBSERVATIONS:
+    if len(observations) > max_observations:
         raise InvalidPhasingInputError(
-            f"observations: at most {MAX_OBSERVATIONS} reads, got {len(observations)}"
+            f"observations: at most {max_observations} reads, "
+            f"got {len(observations)}"
         )
 
     checked: list[Observation] = []
@@ -544,4 +617,129 @@ def phase_haplotypes(
         assignments=tuple(assignments),
         free_components=_free_components(L, obs_list),
         search=stats,
+    )
+
+
+def _validate_ploidy(ploidy: object) -> int:
+    if not _is_plain_int(ploidy):
+        kind = "bool" if isinstance(ploidy, bool) else type(ploidy).__name__
+        raise InvalidPhasingInputError(
+            f"ploidy: expected int, got {kind}; bool is not accepted"
+        )
+    if ploidy not in POLYPLOID_PLOIDIES:
+        raise InvalidPhasingInputError(
+            f"ploidy: must be one of {POLYPLOID_PLOIDIES}, got {ploidy}"
+        )
+    return ploidy  # type: ignore[return-value]
+
+
+def phase_polyploid(
+    loci: int,
+    observations: Sequence[Observation],
+    *,
+    ploidy: int,
+) -> PolyploidPhasingResult:
+    """Phase with an explicit copy number (2 or 3) by complete enumeration.
+
+    Each read is assigned to the single copy with the fewest mismatches and
+    contributes ``flip_cost * (that minimum)`` to the objective. The
+    candidate space is every sorted tuple of ``ploidy`` binary haplotypes of
+    length ``loci`` (copies are interchangeable and may coincide); ties are
+    broken by canonical haplotype ordering, i.e. the lexicographically
+    smallest sorted tuple is reported as ``haplotypes``.
+
+    Raises InvalidPhasingInputError for contract violations (with a message
+    pinpointing the offending argument). The enumeration is complete and
+    bounded (at most C(2**6 + 2, 3) = 45760 candidates), so there is no
+    search budget and no budget-exhaustion state for this entry point.
+    """
+    p = _validate_ploidy(ploidy)
+    L, obs_list = _validate_inputs(
+        loci,
+        observations,
+        None,
+        max_loci=POLYPLOID_MAX_LOCI,
+        max_observations=POLYPLOID_MAX_OBSERVATIONS,
+    )
+
+    # Haplotypes are encoded as ints 0..2**L-1 whose bits, MSB first, are
+    # loci 0..L-1; int order then coincides with lexicographic bit order.
+    # mis[i][v] = mismatches of read i against haplotype v (missing skipped).
+    mis: list[list[int]] = []
+    for obs in obs_list:
+        row = [0] * (1 << L)
+        for v in range(1 << L):
+            count = 0
+            for k, allele in enumerate(obs.alleles):
+                if allele is not None and allele != ((v >> (L - 1 - k)) & 1):
+                    count += 1
+            row[v] = count
+        mis.append(row)
+    weights = [obs.flip_cost for obs in obs_list]
+
+    best: Optional[int] = None
+    second: Optional[int] = None
+    optima: list[tuple[int, ...]] = []
+    candidates_evaluated = 0
+    for combo in combinations_with_replacement(range(1 << L), p):
+        total = 0
+        for i in range(len(obs_list)):
+            row = mis[i]
+            total += weights[i] * min(row[v] for v in combo)
+        candidates_evaluated += 1
+        if best is None or total < best:
+            if best is not None:
+                second = best if second is None else min(second, best)
+            best = total
+            optima = [combo]
+        elif total == best:
+            optima.append(combo)
+        elif second is None or total < second:
+            second = total
+
+    def decode(v: int) -> tuple[int, ...]:
+        return tuple((v >> (L - 1 - k)) & 1 for k in range(L))
+
+    # combinations_with_replacement already yields lexicographic order, so
+    # `optima` is sorted and its first element is the canonical solution.
+    optimal_solutions = tuple(
+        tuple(decode(v) for v in combo) for combo in optima
+    )
+    haplotypes = optimal_solutions[0]
+
+    assignments: list[CopyAssignment] = []
+    for i, obs in enumerate(obs_list):
+        costs: list[int] = []
+        flips: list[tuple[int, ...]] = []
+        for h in haplotypes:
+            flip_loci = tuple(
+                k
+                for k, allele in enumerate(obs.alleles)
+                if allele is not None and allele != h[k]
+            )
+            flips.append(flip_loci)
+            costs.append(weights[i] * len(flip_loci))
+        cheapest = min(costs)
+        assigned = costs.index(cheapest)
+        tied = costs.count(cheapest) > 1
+        assignments.append(
+            CopyAssignment(
+                index=i,
+                assigned=assigned,
+                tied=tied,
+                costs=tuple(costs),
+                flips=tuple(flips),
+                flips_applied=flips[assigned],
+            )
+        )
+
+    return PolyploidPhasingResult(
+        ploidy=p,
+        haplotypes=haplotypes,
+        optimal_solutions=optimal_solutions,
+        optimal_cost=best,  # type: ignore[arg-type]
+        second_best_cost=second,
+        gap=None if second is None else second - best,  # type: ignore[operator]
+        assignments=tuple(assignments),
+        candidates_evaluated=candidates_evaluated,
     )
