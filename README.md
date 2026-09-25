@@ -13,11 +13,11 @@
 ## 准确命令
 
 ```bash
-# 必要测试（含 ≤10 位独立全枚举参考，120 个随机用例）
-python -m unittest discover -s tests -v
+# 必要测试（含 ≤10 位独立全枚举参考，120 个随机用例；top-K 另有 ≤8 位全枚举参考）
+./.venv/bin/python -m unittest discover -s tests -v
 
-# 固定输入演示：一个正常定相结果 + 实际触发的输入拒绝 + 预算耗尽异常
-python demo.py
+# 固定输入演示：正常定相结果 + top-K 排名列表 + 实际触发的输入拒绝/预算边界
+./.venv/bin/python demo.py
 ```
 
 演示真实执行分支界限并打印搜索计数，不 sleep、不预录结果，在普通笔记本上
@@ -86,6 +86,36 @@ result = phase_haplotypes(
 
 ### 错误语义
 
+### top-K 入口：`phase_haplotypes_top_k`
+
+```python
+from haplophase import phase_haplotypes_top_k
+
+top = phase_haplotypes_top_k(loci, observations, k, *, max_nodes=None)
+```
+
+返回按 **(总代价, 单倍型字典序)** 排列的前 `k` 个**不同**解；`k` 为普通 int，
+范围 1..`MAX_TOP_K`（=20），bool/float/越界一律 `InvalidPhasingInputError`。
+仍然固定 `h[0]=0` 去除互补重复，二倍体与代价定义与 `phase_haplotypes` 完全
+一致。返回 `TopKResult`：
+
+| 字段 | 含义 |
+|---|---|
+| `candidates` | `TopKCandidate` 元组，按名次排列；每个含 `rank`（1 起）、`haplotype`、`complement`、`cost` 和该候选自己的每读段 `assignments`（归属 + 修改位置 `flips_applied`） |
+| `k` | 请求的 K |
+| `complete` | 搜索是否完成；完成为 True 时排名被证明 |
+| `exhaustive` | 合法解总数不足 K 时为 True，表示已返回全部解（明确穷尽） |
+| `solution_count` | 完成时合法解总数（恒为 `2**(loci-1)`）；未完成时 `None` |
+| `remaining_lower_bound` | 预算耗尽时，所有未探索分支代价的下界；完成时为 `None`。**这是搜索下界，不是** `phase_haplotypes` 的次优间隔 `gap` |
+| `search` | 同样的 `SearchStats` 计数 |
+
+搜索维护当前第 K 个代价作为门限，子树下界**严格大于**门限才剪枝
+（`>`，不用 `>=`），因此等代价候选不会被剪没；只有证明剩余分支进不了前 K
+才整枝剪去。`max_nodes` 预算耗尽时**不抛异常**，而是返回 `complete=False` 的
+部分列表：候选都是代价精确的可行解，但名次未证明，并附 `remaining_lower_bound`。
+
+### 错误语义
+
 - `InvalidPhasingInputError`（继承 `ValueError`）：违反契约即拒绝，错误信息
   定位到参数位置，如 `observations[3].alleles[7]`；**不静默纠正**。
   数值输入拒绝 `NaN`/`Infinity` 与一切 float；整数参数拒绝 `bool`。
@@ -114,9 +144,11 @@ result = phase_haplotypes(
    取反）。
 6. **精确性**：全部代价是 Python 任意精度整数，无浮点、无容差。
 7. **独立验收**：`tests/reference.py` 用 `itertools.product` 对 ≤10 位实例做
-   全枚举，公式独立编写，不导入被测核心来产生期望值；120 个带固定种子的
-   随机实例（含全缺失读段、非均匀权重）逐一核对最优值、全部最优解、严格次优、
-   gap 与每读段归属。
+  全枚举，公式独立编写，不导入被测核心来产生期望值；120 个带固定种子的
+  随机实例（含全缺失读段、非均匀权重）逐一核对最优值、全部最优解、严格次优、
+  gap 与每读段归属。top-K 另有 ≤8 位全枚举参考（`brute_force_top_k`），
+  60 个随机实例逐一核对完整排名、每候选读段归属与穷尽标记，并专测零信息
+  读段、等代价候选并列、唯一最优与 K=1。
 
 ## 输入上限（接口边界）
 
@@ -145,6 +177,7 @@ haplophase/__init__.py   # 公共导出
 haplophase/core.py       # 校验、分支界限、连通分量、结果组装
 tests/reference.py       # 独立全枚举参考（不调用被测核心求期望值）
 tests/test_phase.py      # 必要测试
+tests/test_top_k.py      # top-K 入口测试（≤8 位全枚举参照）
 demo.py                  # 固定输入演示（正常结果 + 拒绝/异常边界）
 README.md
 ```

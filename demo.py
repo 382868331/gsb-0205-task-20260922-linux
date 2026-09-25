@@ -24,6 +24,7 @@ from haplophase import (
     Observation,
     SearchBudgetExhaustedError,
     phase_haplotypes,
+    phase_haplotypes_top_k,
 )
 
 
@@ -167,6 +168,52 @@ def main() -> None:
         )
         print("  (every validated instance is feasible, so this is not a "
               "'no solution' verdict: rerun without max_nodes to prove it.)")
+
+    # ------------------------------------------------------------------ D
+    show("D. Top-K listing: ranked distinct candidates (K=5, 8 loci)")
+    rng3 = random.Random(20260925)
+    truth3 = (0, 1, 1, 0, 0, 1, 0, 1)
+    reads3 = []
+    for _ in range(14):
+        lo = rng3.randrange(0, 5)
+        hi = min(8, lo + rng3.randint(2, 5))
+        row = []
+        for kpos in range(8):
+            if lo <= kpos < hi:
+                bit = truth3[kpos]
+                if rng3.random() < 0.15:
+                    bit = 1 - bit  # sequencing error
+                row.append(bit)
+            else:
+                row.append(None)
+        reads3.append(Observation(tuple(row), rng3.randint(1, 4)))
+    t0 = time.perf_counter()
+    top = phase_haplotypes_top_k(8, reads3, 5)
+    dt = time.perf_counter() - t0
+    print(f"complete={top.complete}  exhaustive={top.exhaustive}  "
+          f"solution_count={top.solution_count}")
+    for cand in top.candidates:
+        hstr = "".join(map(str, cand.haplotype))
+        moved = sorted(
+            {site for a in cand.assignments for site in a.flips_applied}
+        )
+        flips = "none" if not moved else ",".join(str(s + 1) for s in moved)
+        print(f"  rank {cand.rank}: h={hstr}  cost={cand.cost}  "
+              f"flip loci: {flips}")
+    s = top.search
+    print(f"search: nodes {s.nodes_opened}, leaves {s.leaves_evaluated}, "
+          f"pruned {s.branches_pruned}  ({dt * 1000:.1f} ms)")
+
+    show("D2. Top-K with a tiny node budget: unproven ranks, not a gap")
+    partial = phase_haplotypes_top_k(8, reads3, 5, max_nodes=6)
+    print(f"complete={partial.complete}  "
+          f"remaining_lower_bound={partial.remaining_lower_bound}")
+    for cand in partial.candidates:
+        print(f"  (unproven) rank {cand.rank}: h="
+              f"{''.join(map(str, cand.haplotype))}  cost={cand.cost}")
+    print("  -> budget stop returns the best candidates found so far; the "
+          "lower bound covers every unexplored branch and is NOT the "
+          "proven second-best gap of phase_haplotypes.")
 
     print()
     print("demo finished.")

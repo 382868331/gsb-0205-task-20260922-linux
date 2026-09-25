@@ -43,6 +43,19 @@ def brute_force(loci, raw_reads):
     return best, optima, second
 
 
+def brute_force_top_k(loci, raw_reads, k):
+    """Independent top-K reference: every canonical h (h[0]=0) is scored
+    with the standalone formula and sorted by (cost, h); returns the first
+    k (cost, h) pairs plus the total number of feasible candidates."""
+    scored = []
+    for bits in product((0, 1), repeat=loci):
+        if bits[0] != 0:
+            continue
+        scored.append((reference_cost(bits, raw_reads), bits))
+    scored.sort()
+    return scored[:k], len(scored)
+
+
 def reference_assignment(h, alleles, weight):
     """Independent expected (assigned, tied, c0, c1, flips0, flips1)."""
     flips0 = tuple(k for k, a in enumerate(alleles) if a is not None and a != h[k])

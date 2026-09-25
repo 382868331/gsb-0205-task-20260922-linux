@@ -16,24 +16,30 @@ point for costs.
 from __future__ import annotations
 
 import math
+from bisect import insort
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
 __all__ = [
     "Observation",
     "PhasingResult",
+    "TopKCandidate",
+    "TopKResult",
     "ReadAssignment",
     "SearchStats",
     "PhasingError",
     "InvalidPhasingInputError",
     "SearchBudgetExhaustedError",
     "phase_haplotypes",
+    "phase_haplotypes_top_k",
     "MAX_LOCI",
     "MAX_OBSERVATIONS",
+    "MAX_TOP_K",
 ]
 
 MAX_LOCI = 18
 MAX_OBSERVATIONS = 200
+MAX_TOP_K = 20
 
 _H0 = 0  # label of the reported haplotype h
 _H1 = 1  # label of the complement 1-h
@@ -160,6 +166,51 @@ class PhasingResult:
     search: SearchStats
 
 
+@dataclass(frozen=True)
+class TopKCandidate:
+    """One entry of a top-K listing.
+
+    rank: 1-based position in the (cost, haplotype) ordering.
+    haplotype / complement: the candidate h (h[0] = 0) and 1-h.
+    cost: exact total weighted flip cost.
+    assignments: per-read assignment for this candidate's haplotype.
+    """
+
+    rank: int
+    haplotype: tuple[int, ...]
+    complement: tuple[int, ...]
+    cost: int
+    assignments: tuple[ReadAssignment, ...]
+
+
+@dataclass(frozen=True)
+class TopKResult:
+    """Top-K distinct phasing solutions, ordered by (cost, haplotype).
+
+    candidates: the best min(k, #feasible) distinct h found, sorted by
+        (total cost, haplotype lexicographic); every h starts with 0.
+    k: the requested K (1..MAX_TOP_K).
+    complete: True iff the search finished, so the ranking is proven.
+        When False (node budget exhausted) the listed candidates are the
+        best found so far and their ranks are NOT proven.
+    exhaustive: True iff every feasible h is listed (only possible when
+        complete and fewer than k distinct feasible solutions exist).
+    solution_count: total number of feasible h when complete (always
+        2**(loci-1), since every h is admissible); None when unproven.
+    remaining_lower_bound: when complete is False, a lower bound on the
+        cost of every candidate in any unexplored branch; None otherwise.
+        This is a search bound, not the proven second-best gap of
+        phase_haplotypes.
+    search: branch-and-bound search state.
+    """
+
+    candidates: tuple[TopKCandidate, ...]
+    k: int
+    complete: bool
+    exhaustive: bool
+    solution_count: Optional[int]
+    remaining_lower_bound: Optional[int]
+    search: SearchStats
 def _is_plain_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -312,6 +363,37 @@ def _greedy_seed(
     if flip_last and loci >= 2:
         bits[-1] ^= 1
     return tuple(bits)
+
+
+def _build_assignments(
+    obs_list: Sequence[Observation],
+    covered_sites: Sequence[Sequence[int]],
+    weights: Sequence[int],
+    h: tuple[int, ...],
+) -> list[ReadAssignment]:
+    """Per-read assignment of every read to the cheaper of h and 1-h."""
+    assignments: list[ReadAssignment] = []
+    for i, obs in enumerate(obs_list):
+        flips0 = [k for k in covered_sites[i] if obs.alleles[k] != h[k]]
+        flips1 = [k for k in covered_sites[i] if obs.alleles[k] == h[k]]
+        c0 = weights[i] * len(flips0)
+        c1 = weights[i] * len(flips1)
+        tied = c0 == c1
+        assigned = _H0 if c0 <= c1 else _H1
+        flips_applied = flips0 if assigned == _H0 else flips1
+        assignments.append(
+            ReadAssignment(
+                index=i,
+                assigned=assigned,
+                tied=tied,
+                cost_to_h0=c0,
+                cost_to_h1=c1,
+                flips_to_h0=tuple(flips0),
+                flips_to_h1=tuple(flips1),
+                flips_applied=tuple(flips_applied),
+            )
+        )
+    return assignments
 
 
 def _free_components(
@@ -500,28 +582,6 @@ def phase_haplotypes(
     h = optimal_haplotypes[0]
     complement = tuple(1 - bit for bit in h)
 
-    assignments: list[ReadAssignment] = []
-    for i, obs in enumerate(obs_list):
-        flips0 = [k for k in covered_sites[i] if obs.alleles[k] != h[k]]
-        flips1 = [k for k in covered_sites[i] if obs.alleles[k] == h[k]]
-        c0 = weights[i] * len(flips0)
-        c1 = weights[i] * len(flips1)
-        tied = c0 == c1
-        assigned = _H0 if c0 <= c1 else _H1
-        flips_applied = flips0 if assigned == _H0 else flips1
-        assignments.append(
-            ReadAssignment(
-                index=i,
-                assigned=assigned,
-                tied=tied,
-                cost_to_h0=c0,
-                cost_to_h1=c1,
-                flips_to_h0=tuple(flips0),
-                flips_to_h1=tuple(flips1),
-                flips_applied=tuple(flips_applied),
-            )
-        )
-
     stats = SearchStats(
         depth=L,
         budget=max_nodes,
@@ -541,7 +601,208 @@ def phase_haplotypes(
         optimal_cost=best,  # type: ignore[arg-type]
         second_best_cost=second,
         gap=None if second is None else second - best,  # type: ignore[operator]
-        assignments=tuple(assignments),
+        assignments=tuple(
+            _build_assignments(obs_list, covered_sites, weights, h)
+        ),
         free_components=_free_components(L, obs_list),
+        search=stats,
+    )
+
+
+def phase_haplotypes_top_k(
+    loci: int,
+    observations: Sequence[Observation],
+    k: object,
+    *,
+    max_nodes: Optional[int] = None,
+) -> TopKResult:
+    """Return the top-k distinct phasing solutions.
+
+    Solutions are ordered by (total cost, haplotype lexicographic). The
+    complement symmetry is removed by fixing h[0] = 0, so every reported
+    candidate is a distinct phasing and 1 <= k <= MAX_TOP_K.
+
+    Each candidate carries its exact cost and the per-read assignment /
+    flip positions for that haplotype. The branch-and-bound prunes a child
+    only when its admissible prefix bound is *strictly greater* than the
+    current k-th cost: equal-cost candidates are never discarded by a
+    non-strict (>=) rule.
+
+    When max_nodes is exhausted before the search finishes, a TopKResult is
+    still returned with complete = False: the listed candidates are the best
+    found (seeds included) but their ranks are not proven, and
+    remaining_lower_bound gives a bound below which no unexplored branch can
+    contribute. This partial state is never relabelled as the proven
+    second-best gap of phase_haplotypes.
+
+    Raises InvalidPhasingInputError for contract violations; k must be a
+    plain int (bool rejected) in 1..MAX_TOP_K.
+    """
+    if not _is_plain_int(k):
+        kind = "bool" if isinstance(k, bool) else type(k).__name__
+        raise InvalidPhasingInputError(
+            f"k: expected int in 1..{MAX_TOP_K}, got {kind}; bool is not accepted"
+        )
+    if not 1 <= k <= MAX_TOP_K:
+        raise InvalidPhasingInputError(
+            f"k: must satisfy 1 <= k <= {MAX_TOP_K}, got {k}"
+        )
+    L, obs_list = _validate_inputs(loci, observations, max_nodes)
+    n = len(obs_list)
+    weights = [obs.flip_cost for obs in obs_list]
+    covered_sites = [
+        [j for j, allele in enumerate(obs.alleles) if allele is not None]
+        for obs in obs_list
+    ]
+    watch: list[list[tuple[int, int]]] = [[] for _ in range(L)]
+    for i, obs in enumerate(obs_list):
+        for j in covered_sites[i]:
+            watch[j].append((i, obs.alleles[j]))  # type: ignore[arg-type]
+
+    # found holds at most k (cost, h) pairs sorted by (cost, h); the seeds
+    # are feasible candidates with exactly evaluated costs.
+    seed0 = _greedy_seed(L, weights, watch, flip_last=False)
+    found: list[tuple[int, tuple[int, ...]]] = [(_evaluate(seed0, obs_list), seed0)]
+    seed_costs = [found[0][0]]
+    if L >= 2:
+        seed1 = _greedy_seed(L, weights, watch, flip_last=True)
+        c1 = _evaluate(seed1, obs_list)
+        seed_costs.append(c1)
+        insort(found, (c1, seed1))
+        del found[k:]
+
+    mis = [0] * n
+    seen = [0] * n
+    bits = [0] * L
+    nodes_by_depth = [0] * (L + 1)
+    pruned_by_depth = [0] * L
+    nodes_opened = 0
+    leaves_evaluated = 0
+    branches_pruned = 0
+    incumbent_updates = len(found)
+    stopped = False
+    remaining_lb: Optional[int] = None
+
+    def note_frontier(lb: int) -> None:
+        nonlocal remaining_lb
+        remaining_lb = lb if remaining_lb is None else min(remaining_lb, lb)
+
+    def offer(cost: int, h_candidate: tuple[int, ...]) -> bool:
+        key = (cost, h_candidate)
+        for _, existing in found:
+            if existing == h_candidate:
+                return False
+        if len(found) < k:
+            insort(found, key)
+            return True
+        if key < found[-1]:
+            insort(found, key)
+            del found[k:]
+            return True
+        return False
+
+    def child_delta(depth: int, bit: int) -> int:
+        delta = 0
+        for i, allele in watch[depth]:
+            m, s, w = mis[i], seen[i], weights[i]
+            old = w * min(m, s - m)
+            new_m = m + (1 if allele != bit else 0)
+            delta += w * min(new_m, s + 1 - new_m) - old
+        return delta
+
+    def commit(depth: int, bit: int) -> None:
+        for i, allele in watch[depth]:
+            seen[i] += 1
+            if allele != bit:
+                mis[i] += 1
+
+    def rollback(depth: int, bit: int) -> None:
+        for i, allele in watch[depth]:
+            seen[i] -= 1
+            if allele != bit:
+                mis[i] -= 1
+
+    def dfs(depth: int, lb: int) -> None:
+        nonlocal nodes_opened, leaves_evaluated, branches_pruned
+        nonlocal incumbent_updates, stopped
+        nodes_opened += 1
+        nodes_by_depth[depth] += 1
+        if max_nodes is not None and nodes_opened > max_nodes:
+            stopped = True
+            note_frontier(lb)
+            return
+        if depth == L:
+            leaves_evaluated += 1
+            if offer(lb, tuple(bits)):
+                incumbent_updates += 1
+            return
+
+        # Strict-greater bound only: a subtree whose prefix bound equals the
+        # current k-th cost can still contain an equal-cost, lex-smaller h
+        # that belongs in the listing, so it must be expanded.
+        threshold = found[-1][0] if len(found) >= k else None
+        children = sorted(
+            ((bit, lb + child_delta(depth, bit)) for bit in (0, 1)),
+            key=lambda item: (item[1], item[0]),
+        )
+        for idx, (bit, child_lb) in enumerate(children):
+            if threshold is not None and child_lb > threshold:
+                branches_pruned += 1
+                pruned_by_depth[depth] += 1
+                continue
+            commit(depth, bit)
+            bits[depth] = bit
+            dfs(depth + 1, child_lb)
+            rollback(depth, bit)
+            if stopped:
+                for _, later_lb in children[idx + 1:]:
+                    note_frontier(later_lb)
+                return
+
+    bits[0] = 0
+    root_lb = child_delta(0, 0)
+    commit(0, 0)
+    dfs(1, root_lb)
+
+    complete = not stopped
+    total_solutions = (1 << (L - 1)) if complete else None
+    exhaustive = bool(
+        complete and total_solutions is not None and len(found) >= total_solutions
+    )
+
+    candidates: list[TopKCandidate] = []
+    for rank, (cost, h_candidate) in enumerate(found, start=1):
+        assignments = _build_assignments(
+            obs_list, covered_sites, weights, h_candidate
+        )
+        candidates.append(
+            TopKCandidate(
+                rank=rank,
+                haplotype=h_candidate,
+                complement=tuple(1 - bit for bit in h_candidate),
+                cost=cost,
+                assignments=tuple(assignments),
+            )
+        )
+
+    stats = SearchStats(
+        depth=L,
+        budget=max_nodes,
+        completed=complete,
+        nodes_opened=nodes_opened,
+        leaves_evaluated=leaves_evaluated,
+        branches_pruned=branches_pruned,
+        incumbent_updates=incumbent_updates,
+        nodes_by_depth=tuple(nodes_by_depth),
+        pruned_by_depth=tuple(pruned_by_depth),
+        seed_costs=tuple(sorted(seed_costs)),
+    )
+    return TopKResult(
+        candidates=tuple(candidates),
+        k=k,
+        complete=complete,
+        exhaustive=exhaustive,
+        solution_count=total_solutions,
+        remaining_lower_bound=remaining_lb if not complete else None,
         search=stats,
     )
