@@ -11,6 +11,8 @@ import unittest
 from haplophase import (
     MAX_LOCI,
     MAX_OBSERVATIONS,
+    BoltzmannPosterior,
+    boltzmann_posterior,
     InvalidPhasingInputError,
     Observation,
     SearchBudgetExhaustedError,
@@ -18,11 +20,18 @@ from haplophase import (
 )
 
 from reference import (
+    reference_boltzmann,
     brute_force,
     random_cases,
     reference_assignment,
     reference_cost,
 )
+
+
+def assert_float_sequence_close(test_case, actual, expected, tol=1e-12):
+    test_case.assertEqual(len(actual), len(expected))
+    for a, b in zip(actual, expected):
+        test_case.assertAlmostEqual(a, b, delta=tol)
 
 
 def to_obs(raw_reads):
@@ -74,6 +83,108 @@ class ExactAgreementWithBruteForce(unittest.TestCase):
         r1 = phase_haplotypes(loci, to_obs(raw))
         r2 = phase_haplotypes(loci, to_obs(raw))
         self.assertEqual(r1, r2)
+
+
+class BoltzmannPosteriorTests(unittest.TestCase):
+    def test_matches_independent_global_enumeration(self):
+        for loci, raw in random_cases(seed=20260926, count=40):
+            temperature = 0.37
+            posterior = boltzmann_posterior(loci, to_obs(raw), temperature)
+            marginals, log_z, entropy, count = reference_boltzmann(
+                loci, raw, temperature
+            )
+            self.assertIsInstance(posterior, BoltzmannPosterior)
+            self.assertEqual(posterior.temperature, temperature)
+            self.assertEqual(posterior.canonical_configuration_count, count)
+            assert_float_sequence_close(self, posterior.marginals, marginals)
+            self.assertAlmostEqual(posterior.log_normalizer, log_z, places=10)
+            self.assertAlmostEqual(posterior.entropy, entropy, places=10)
+            self.assertTrue(all(0.0 <= p <= 1.0 for p in posterior.marginals))
+
+    def test_all_costs_equal_gives_uniform_canonical_posterior(self):
+        raw = []
+        posterior = boltzmann_posterior(3, raw, temperature=2.0)
+        self.assertEqual(posterior.canonical_configuration_count, 4)
+        assert_float_sequence_close(
+            self, posterior.marginals, (0.0, 0.5, 0.5)
+        )
+        self.assertAlmostEqual(posterior.log_normalizer, math.log(4.0), places=12)
+        self.assertAlmostEqual(posterior.entropy, 2.0 * math.log(2.0), places=12)
+
+    def test_disconnected_components_are_counted_without_extra_division(self):
+        raw = [
+            ((0, 0, None, None), 1),
+            ((None, None, 0, 1), 1),
+        ]
+        posterior = boltzmann_posterior(4, to_obs(raw), temperature=1.0)
+        self.assertEqual(
+            [c.configuration_count for c in posterior.components], [2, 4]
+        )
+        self.assertEqual(posterior.canonical_configuration_count, 8)
+        marginals, log_z, entropy, count = reference_boltzmann(4, raw, 1.0)
+        assert_float_sequence_close(self, posterior.marginals, marginals)
+        self.assertAlmostEqual(posterior.log_normalizer, log_z, places=12)
+        self.assertAlmostEqual(posterior.entropy, entropy, places=12)
+
+    def test_completely_unsupported_locus_is_coin_flip(self):
+        raw = [((0, 1, None), 1)]
+        posterior = boltzmann_posterior(3, to_obs(raw), temperature=0.5)
+        marginals, log_z, entropy, _ = reference_boltzmann(3, raw, 0.5)
+        assert_float_sequence_close(self, posterior.marginals, marginals)
+        self.assertAlmostEqual(posterior.marginals[2], 0.5)
+        self.assertAlmostEqual(posterior.log_normalizer, log_z, places=12)
+        self.assertAlmostEqual(posterior.entropy, entropy, places=12)
+
+    def test_extreme_low_temperature_uses_log_shifted_density_without_zero_divide(self):
+        raw = [
+            ((0, 0), 1),
+            ((0, 1), 1),
+            ((1, 0), 1),
+        ]
+        posterior = boltzmann_posterior(2, to_obs(raw), temperature=1e-100)
+        assert_float_sequence_close(self, posterior.marginals, (0.0, 1.0))
+        self.assertEqual(posterior.entropy, 0.0)
+        self.assertTrue(math.isfinite(posterior.components[0].log_normalizer))
+
+    def test_equal_optima_remain_uncertain_at_extreme_low_temperature(self):
+        raw = [((0, 0, None, None), 1), ((None, None, 0, 0), 1)]
+        posterior = boltzmann_posterior(4, to_obs(raw), temperature=1e-100)
+        assert_float_sequence_close(
+            self, posterior.marginals, (0.0, 0.0, 0.5, 0.5)
+        )
+        self.assertAlmostEqual(posterior.entropy, math.log(2.0), places=12)
+
+    def test_same_optimum_can_have_different_posterior_uncertainty(self):
+        sharp_raw = [
+            ((0, 0, 0), 10),
+            ((0, 0, 1), 10),
+            ((0, 1, 0), 10),
+        ]
+        broad_raw = [
+            ((0, 0, 0), 1),
+            ((0, 0, 1), 1),
+            ((0, 1, 0), 1),
+        ]
+        sharp = boltzmann_posterior(3, to_obs(sharp_raw), 0.5)
+        broad = boltzmann_posterior(3, to_obs(broad_raw), 0.5)
+        self.assertEqual(
+            phase_haplotypes(3, to_obs(sharp_raw)).haplotype,
+            phase_haplotypes(3, to_obs(broad_raw)).haplotype,
+        )
+        self.assertLess(sharp.entropy, broad.entropy)
+
+    def test_temperature_must_be_positive_finite(self):
+        obs = []
+        for bad in (0, -1, True, False, math.nan, math.inf, -math.inf, "1"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(InvalidPhasingInputError):
+                    boltzmann_posterior(2, obs, bad)
+
+    def test_posterior_reuses_original_input_contract(self):
+        with self.assertRaises(InvalidPhasingInputError):
+            boltzmann_posterior(0, [], 1.0)
+        with self.assertRaises(InvalidPhasingInputError):
+            boltzmann_posterior(2, [Observation((0, 2), 1)], 1.0)
 
 
 class StructuralScenarios(unittest.TestCase):

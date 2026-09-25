@@ -8,6 +8,7 @@ all 2**(loci-1) canonical candidates (loci <= 10) with plain itertools.
 from __future__ import annotations
 
 import random
+import math
 from itertools import product
 
 MAX_REFERENCE_LOCI = 10
@@ -41,6 +42,33 @@ def brute_force(loci, raw_reads):
     distinct = sorted({c for c in costs.values() if c > best})
     second = distinct[0] if distinct else None
     return best, optima, second
+
+
+def reference_boltzmann(loci, raw_reads, temperature):
+    """Independent global canonical Boltzmann enumeration."""
+    records = []
+    for bits in product((0, 1), repeat=loci):
+        h = bits
+        if h[0] != 0:
+            continue
+        records.append((h, reference_cost(h, raw_reads)))
+
+    minimum_cost = min(cost for _, cost in records)
+    shifted_weights = [
+        math.exp(-(cost - minimum_cost) / temperature) for _, cost in records
+    ]
+    total = math.fsum(shifted_weights)
+    probabilities = [weight / total for weight in shifted_weights]
+    marginals = [0.0] * loci
+    for h, probability in zip((candidate for candidate, _ in records), probabilities):
+        for site, bit in enumerate(h):
+            marginals[site] += bit * probability
+
+    entropy = -math.fsum(
+        p * math.log(p) for p in probabilities if p > 0.0
+    )
+    log_normalizer = -minimum_cost / temperature + math.log(total)
+    return marginals, log_normalizer, entropy, len(records)
 
 
 def reference_assignment(h, alleles, weight):

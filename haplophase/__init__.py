@@ -5,6 +5,8 @@ and bound. See ``haplophase.core`` for the full contract.
 """
 
 from .core import (
+    BoltzmannComponentResult,
+    BoltzmannPosterior,
     MAX_LOCI,
     MAX_OBSERVATIONS,
     InvalidPhasingInputError,
@@ -14,10 +16,13 @@ from .core import (
     ReadAssignment,
     SearchBudgetExhaustedError,
     SearchStats,
+    boltzmann_posterior,
     phase_haplotypes,
 )
 
 __all__ = [
+    "BoltzmannComponentResult",
+    "BoltzmannPosterior",
     "MAX_LOCI",
     "MAX_OBSERVATIONS",
     "InvalidPhasingInputError",
@@ -27,6 +32,7 @@ __all__ = [
     "ReadAssignment",
     "SearchBudgetExhaustedError",
     "SearchStats",
+    "boltzmann_posterior",
     "phase_haplotypes",
 ]
 

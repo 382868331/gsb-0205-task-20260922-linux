@@ -8,14 +8,17 @@ Observation
     cost of flipping *one* observed allele in that read.
 phase_haplotypes(loci, observations, *, max_nodes=None) -> PhasingResult
     Exact weighted minimum-error-correction phasing.
+boltzmann_posterior(loci, observations, temperature) -> BoltzmannPosterior
+    Canonical Boltzmann posterior over the same cost function.
 
-All arithmetic is exact integer arithmetic; the package never uses floating
-point for costs.
+The MAP search uses exact integer arithmetic; the separate Boltzmann entry
+point uses IEEE floating-point logarithms and probabilities.
 """
 
 from __future__ import annotations
 
 import math
+from itertools import product
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -28,6 +31,9 @@ __all__ = [
     "InvalidPhasingInputError",
     "SearchBudgetExhaustedError",
     "phase_haplotypes",
+    "BoltzmannComponentResult",
+    "BoltzmannPosterior",
+    "boltzmann_posterior",
     "MAX_LOCI",
     "MAX_OBSERVATIONS",
 ]
@@ -76,6 +82,40 @@ class SearchBudgetExhaustedError(RuntimeError):
         self.leaves_evaluated = leaves_evaluated
         self.best_cost = best_cost
         self.best_haplotype = best_haplotype
+
+
+@dataclass(frozen=True)
+class BoltzmannComponentResult:
+    """Posterior statistics for one connected component of covered loci.
+
+    The component containing locus 0 is anchored by ``h[0] = 0`` and has
+    ``2**(len(sites)-1)`` configurations. Every other component retains its
+    full local flip freedom and has ``2**len(sites)`` configurations.
+    """
+
+    sites: tuple[int, ...]
+    anchored: bool
+    configuration_count: int
+    marginals: tuple[float, ...]
+    log_normalizer: float
+    entropy: float
+
+
+@dataclass(frozen=True)
+class BoltzmannPosterior:
+    """Canonical Boltzmann posterior ``weight(h) = exp(-cost(h)/T)``.
+
+    marginals give ``P(h[k] = 1)``; log_normalizer and entropy use natural
+    logarithms (nats). Components are independent under the fragment-overlap
+    factorization, so their log-normalizers and entropies add.
+    """
+
+    temperature: float
+    marginals: tuple[float, ...]
+    log_normalizer: float
+    entropy: float
+    components: tuple[BoltzmannComponentResult, ...]
+    canonical_configuration_count: int
 
 
 @dataclass(frozen=True)
@@ -317,6 +357,36 @@ def _greedy_seed(
 def _free_components(
     loci: int, obs_list: Sequence[Observation]
 ) -> tuple[tuple[int, ...], ...]:
+    groups, _ = _component_groups(loci, obs_list)
+    return tuple(sorted(groups[1:]))
+
+
+def _validate_temperature(temperature: object) -> float:
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+        kind = "bool" if isinstance(temperature, bool) else type(temperature).__name__
+        raise InvalidPhasingInputError(
+            f"temperature: expected a positive finite number, got {kind}"
+        )
+    try:
+        value = float(temperature)
+    except OverflowError:
+        raise InvalidPhasingInputError(
+            "temperature: finite number is too large to represent as a float"
+        ) from None
+    if not math.isfinite(value):
+        raise InvalidPhasingInputError(
+            f"temperature: must be finite, got {temperature!r}"
+        )
+    if value <= 0.0:
+        raise InvalidPhasingInputError(
+            f"temperature: must be > 0, got {temperature!r}"
+        )
+    return value
+
+
+def _component_groups(
+    loci: int, obs_list: Sequence[Observation]
+) -> tuple[tuple[tuple[int, ...], ...], dict[int, int]]:
     parent = list(range(loci))
 
     def find(x: int) -> int:
@@ -335,14 +405,146 @@ def _free_components(
         for k in sites[1:]:
             union(sites[0], k)
 
-    groups: dict[int, list[int]] = {}
-    for k in range(loci):
-        groups.setdefault(find(k), []).append(k)
-    root0 = find(0)
-    free = sorted(
-        tuple(group) for root, group in groups.items() if root != root0
+    grouped: dict[int, list[int]] = {}
+    root_by_site: dict[int, int] = {}
+    for site in range(loci):
+        root = find(site)
+        grouped.setdefault(root, []).append(site)
+        root_by_site[site] = root
+
+    anchor_root = find(0)
+    groups = [tuple(grouped[anchor_root])]
+    groups.extend(
+        tuple(grouped[root])
+        for root in sorted(grouped)
+        if root != anchor_root
     )
-    return tuple(free)
+    return tuple(groups), root_by_site
+
+
+def _local_component_posterior(
+    sites: tuple[int, ...],
+    anchored: bool,
+    reads: Sequence[tuple[Observation, tuple[int, ...]]],
+    temperature: float,
+) -> BoltzmannComponentResult:
+    size = len(sites)
+    free_bits = size - 1 if anchored else size
+    configuration_count = 1 << free_bits
+    records: list[tuple[int, tuple[int, ...]]] = []
+
+    for choice in product((0, 1), repeat=free_bits):
+        if anchored:
+            values = (0, *choice)
+        else:
+            values = tuple(choice)
+        local_cost = 0
+        for obs, local_sites in reads:
+            mismatches = 0
+            covered = len(local_sites)
+            for local_site in local_sites:
+                if obs.alleles[sites[local_site]] != values[local_site]:
+                    mismatches += 1
+            local_cost += obs.flip_cost * min(mismatches, covered - mismatches)
+        records.append((local_cost, values))
+
+    minimum_cost = min(cost for cost, _ in records)
+    weights = [
+        math.exp(-(cost - minimum_cost) / temperature) for cost, _ in records
+    ]
+    weight_sum = math.fsum(weights)
+
+    # At an extremely low temperature ordinary shifted weights can all
+    # underflow.  The limiting distribution is then exactly uniform over all
+    # configurations attaining the integer minimum, so no zero is normalized.
+    if weight_sum == 0.0:
+        minimum_values = {values for cost, values in records if cost == minimum_cost}
+        weights = [1.0 if values in minimum_values else 0.0 for _, values in records]
+        weight_sum = float(len(minimum_values))
+
+    probabilities = [weight / weight_sum for weight in weights]
+    marginals = [0.0] * size
+    for probability, (_, values) in zip(probabilities, records):
+        for j, bit in enumerate(values):
+            if bit:
+                marginals[j] += probability
+
+    entropy = -math.fsum(
+        probability * math.log(probability)
+        for probability in probabilities
+        if probability > 0.0
+    )
+    shifted_log_z = math.log(weight_sum)
+    minimum_term = -minimum_cost / temperature
+    log_normalizer = minimum_term + shifted_log_z
+
+    return BoltzmannComponentResult(
+        sites=sites,
+        anchored=anchored,
+        configuration_count=configuration_count,
+        marginals=tuple(marginals),
+        log_normalizer=log_normalizer,
+        entropy=entropy,
+    )
+
+
+def boltzmann_posterior(
+    loci: int,
+    observations: Sequence[Observation],
+    temperature: float,
+) -> BoltzmannPosterior:
+    """Return the canonical Boltzmann posterior over fixed-h[0] candidates."""
+    L, obs_list = _validate_inputs(loci, observations, None)
+    T = _validate_temperature(temperature)
+    groups, root_by_site = _component_groups(L, obs_list)
+
+    reads_by_root: dict[int, list[tuple[Observation, tuple[int, ...]]]] = {
+        root: [] for root in root_by_site.values()
+    }
+    for obs in obs_list:
+        observed = tuple(
+            site for site, allele in enumerate(obs.alleles) if allele is not None
+        )
+        if not observed:
+            continue
+        root = root_by_site[observed[0]]
+        reads_by_root[root].append((obs, observed))
+
+    component_results: list[BoltzmannComponentResult] = []
+    canonical_configuration_count = 1
+    for component_index, sites in enumerate(groups):
+        root = root_by_site[sites[0]]
+        component_reads = reads_by_root[root]
+        local_reads: list[tuple[Observation, tuple[int, ...]]] = []
+        for obs, global_sites in component_reads:
+            local_sites = tuple(sites.index(site) for site in global_sites)
+            local_reads.append((obs, local_sites))
+        component = _local_component_posterior(
+            sites=sites,
+            anchored=component_index == 0,
+            reads=local_reads,
+            temperature=T,
+        )
+        component_results.append(component)
+        canonical_configuration_count *= component.configuration_count
+
+    marginals = [0.0] * L
+    log_normalizer = 0.0
+    entropy = 0.0
+    for component in component_results:
+        for local_site, global_site in enumerate(component.sites):
+            marginals[global_site] = component.marginals[local_site]
+        log_normalizer += component.log_normalizer
+        entropy += component.entropy
+
+    return BoltzmannPosterior(
+        temperature=T,
+        marginals=tuple(marginals),
+        log_normalizer=log_normalizer,
+        entropy=entropy,
+        components=tuple(component_results),
+        canonical_configuration_count=canonical_configuration_count,
+    )
 
 
 def phase_haplotypes(
