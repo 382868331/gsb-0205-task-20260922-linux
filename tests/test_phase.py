@@ -6,19 +6,26 @@ state, input-error contract, and the search-budget/infeasibility split.
 from __future__ import annotations
 
 import math
+import random
 import unittest
 
 from haplophase import (
     MAX_LOCI,
     MAX_OBSERVATIONS,
+    MAX_TOP_K,
+    Candidate,
     InvalidPhasingInputError,
     Observation,
     SearchBudgetExhaustedError,
+    TopKResult,
     phase_haplotypes,
+    top_k_haplotypes,
 )
 
 from reference import (
     brute_force,
+    brute_top_k,
+    random_instance,
     random_cases,
     reference_assignment,
     reference_cost,
@@ -74,6 +81,122 @@ class ExactAgreementWithBruteForce(unittest.TestCase):
         r1 = phase_haplotypes(loci, to_obs(raw))
         r2 = phase_haplotypes(loci, to_obs(raw))
         self.assertEqual(r1, r2)
+
+
+class TopKAgreementWithBruteForce(unittest.TestCase):
+    def assert_matches_reference(self, loci, raw, k, **kwargs):
+        result = top_k_haplotypes(loci, to_obs(raw), k, **kwargs)
+        expected = brute_top_k(loci, raw, k)
+        self.assertIsInstance(result, TopKResult)
+        self.assertTrue(result.completed)
+        self.assertTrue(result.ranking_proven)
+        self.assertTrue(result.exhausted)
+        self.assertIsNone(result.remaining_lower_bound)
+        self.assertEqual(
+            tuple((c.cost, c.haplotype) for c in result.candidates), expected
+        )
+        self.assertEqual(len(result.candidates), min(k, 2 ** (loci - 1)))
+        self.assertEqual(
+            result.candidates,
+            tuple(sorted(result.candidates, key=lambda c: (c.cost, c.haplotype))),
+        )
+        for candidate, (cost, h) in zip(result.candidates, expected):
+            self.assertIsInstance(candidate, Candidate)
+            self.assertEqual(candidate.haplotype, h)
+            self.assertEqual(candidate.complement, tuple(1 - b for b in h))
+            self.assertEqual(candidate.cost, cost)
+            self.assertEqual(reference_cost(h, raw), cost)
+            self.assertEqual(
+                sum(a.cost_to_h0 if a.assigned == 0 else a.cost_to_h1
+                    for a in candidate.assignments),
+                cost,
+            )
+            for i, (alleles, weight) in enumerate(raw):
+                assignment = candidate.assignments[i]
+                exp = reference_assignment(h, alleles, weight)
+                self.assertEqual(
+                    (
+                        assignment.assigned,
+                        assignment.tied,
+                        assignment.cost_to_h0,
+                        assignment.cost_to_h1,
+                        assignment.flips_to_h0,
+                        assignment.flips_to_h1,
+                    ),
+                    exp,
+                )
+                self.assertEqual(
+                    assignment.flips_applied,
+                    assignment.flips_to_h0
+                    if assignment.assigned == 0
+                    else assignment.flips_to_h1,
+                )
+        return result
+
+    def test_random_cases_through_eight_loci(self):
+        cases = []
+        rng = random.Random(20260925)
+        for loci in range(1, 9):
+            for _ in range(8):
+                cases.append((loci, random_instance(rng, loci)))
+        for loci, raw in cases:
+            for k in (1, 2, 5, 20):
+                with self.subTest(loci=loci, k=k, raw=raw):
+                    self.assert_matches_reference(loci, raw, k)
+
+    def test_zero_information_reads_return_every_canonical_string(self):
+        raw = [
+            ((None, None, None), 1),
+            ((None, None, None), 9),
+        ]
+        result = self.assert_matches_reference(3, raw, 20)
+        self.assertEqual(
+            [c.haplotype for c in result.candidates],
+            [(0, 0, 0), (0, 0, 1), (0, 1, 0), (0, 1, 1)],
+        )
+        self.assertTrue(all(c.cost == 0 for c in result.candidates))
+        self.assertTrue(all(a.tied for c in result.candidates for a in c.assignments))
+
+    def test_equal_cost_candidates_are_lexicographically_ordered(self):
+        raw = [
+            ((0, 0, None, None), 1),
+            ((None, None, 0, 1), 1),
+        ]
+        result = self.assert_matches_reference(4, raw, 5)
+        self.assertEqual(
+            [(c.cost, c.haplotype) for c in result.candidates[:2]],
+            [(0, (0, 0, 0, 1)), (0, (0, 0, 1, 0))],
+        )
+
+    def test_unique_optimum_and_k_one(self):
+        raw = [((0, 0), 10), ((0, 1), 1)]
+        result = self.assert_matches_reference(2, raw, 1)
+        self.assertEqual(len(result.candidates), 1)
+        self.assertEqual(result.candidates[0].haplotype, (0, 0))
+        self.assertEqual(result.candidates[0].cost, 1)
+
+    def test_k_greater_than_legal_count_reports_all_and_exhaustion(self):
+        raw = [((0, 0, None), 1)]
+        result = self.assert_matches_reference(3, raw, MAX_TOP_K)
+        self.assertEqual(len(result.candidates), 4)
+
+    def test_budget_returns_unproven_incumbents_with_remaining_bound(self):
+        raw = [((0, 0, 0, 0), 1), ((0, 1, 0, 1), 1)]
+        result = top_k_haplotypes(4, to_obs(raw), 3, max_nodes=1)
+        self.assertFalse(result.completed)
+        self.assertFalse(result.ranking_proven)
+        self.assertFalse(result.exhausted)
+        self.assertIsInstance(result.remaining_lower_bound, int)
+        self.assertGreaterEqual(result.remaining_lower_bound, 0)
+        self.assertLessEqual(len(result.candidates), 3)
+        for candidate in result.candidates:
+            self.assertEqual(reference_cost(candidate.haplotype, raw), candidate.cost)
+
+    def test_top_k_validation(self):
+        for bad in (0, -1, MAX_TOP_K + 1, 1.0, True, False, None, "3"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(InvalidPhasingInputError):
+                    top_k_haplotypes(2, [], bad)
 
 
 class StructuralScenarios(unittest.TestCase):

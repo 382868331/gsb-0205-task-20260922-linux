@@ -13,15 +13,15 @@
 ## 准确命令
 
 ```bash
-# 必要测试（含 ≤10 位独立全枚举参考，120 个随机用例）
-python -m unittest discover -s tests -v
+# 必要测试（含 ≤10 位原接口全枚举；top-K 对 ≤8 位全枚举参照）
+./.venv/bin/python -m unittest discover -s tests -v
 
-# 固定输入演示：一个正常定相结果 + 实际触发的输入拒绝 + 预算耗尽异常
-python demo.py
+# 固定输入演示：top-K、正常定相结果、输入拒绝和预算耗尽状态
+./.venv/bin/python demo.py
 ```
 
 演示真实执行分支界限并打印搜索计数，不 sleep、不预录结果，在普通笔记本上
-远低于 8 秒（实测约 0.1 秒）。
+远低于 90 秒（测试实测约 0.1 秒）。
 
 ## 问题定义
 
@@ -49,6 +49,15 @@ result = phase_haplotypes(
     loci,                       # int，1 <= loci <= 18，bool 不接受
     observations,               # Observation 的 list/tuple，长度 <= 200
     *,
+    max_nodes=None,             # 可选正整数搜索节点预算
+)
+
+from haplophase import top_k_haplotypes
+
+top = top_k_haplotypes(
+    loci,                       # 同样的二倍体 0/1/缺失输入
+    observations,
+    5,                          # top_k：1..20，返回不同候选
     max_nodes=None,             # 可选正整数搜索节点预算
 )
 ```
@@ -84,6 +93,29 @@ result = phase_haplotypes(
 `leaves_evaluated`、`branches_pruned`、`incumbent_updates`、
 `nodes_by_depth`、`pruned_by_depth`、`seed_costs`（两个确定性初始解代价）。
 
+### top-K 接口
+
+`top_k_haplotypes(loci, observations, top_k, *, max_nodes=None)` 返回冻结
+dataclass `TopKResult`：
+
+| 字段 | 含义 |
+|---|---|
+| `top_k` | 请求的 K；合法整数范围为 `1..20` |
+| `candidates` | 前 K 个**不同**候选；不足 K 个时返回全部首位 0 合法串 |
+| `completed` / `ranking_proven` | 是否已经证明返回列表排名；预算耗尽时均为 `False` |
+| `exhausted` | 是否完整穷尽搜索；不足 K 个候选且搜索完成时为 `True` |
+| `remaining_lower_bound` | 预算耗尽时，未证明剩余部分的可采纳下界；证完为 `None` |
+| `search` | 与原接口相同口径的节点、叶子、剪枝计数 |
+
+排序键固定为 `(总代价, haplotype 字典序)`。每个 `Candidate` 都包含
+`haplotype`、`complement`、`cost` 和该候选自己的 `assignments`；其中每条读段
+仍给出 `assigned`、两条链代价、两边修改位置和实际采用的 `flips_applied`。
+
+top-K 分支界限只有在已找到 K 个完整候选，且某分支下界**严格大于**当前第 K 个
+代价时才剪掉。下界等于第 K 个代价必须保留，因为同分候选可能按字典序进入列表。
+预算耗尽时不抛异常、也不把该下界称为 `gap`：返回已找到的可行候选，同时把
+`ranking_proven=False`、`exhausted=False` 和 `remaining_lower_bound` 明确列出。
+
 ### 错误语义
 
 - `InvalidPhasingInputError`（继承 `ValueError`）：违反契约即拒绝，错误信息
@@ -109,14 +141,16 @@ result = phase_haplotypes(
    等于 `best` 的叶子全部保留。搜索开始前用两个确定性贪心初始解（含一个
    末位翻转变体）提供紧门限；初始解只用于门限，返回值一律来自被完整证明的
    枚举/剪枝过程。
+   top-K 搜索沿用同一前缀下界，改维护有序的 K 个完整候选和第 K 个代价门限。
 5. **歧义结构解释**：对“位点—被同一条读段共同覆盖”建并查集，不含位点 0 的
    连通分量是自由分量，最优解数量恰为 `2^自由分量数`（每个自由分量可整体
    取反）。
 6. **精确性**：全部代价是 Python 任意精度整数，无浮点、无容差。
 7. **独立验收**：`tests/reference.py` 用 `itertools.product` 对 ≤10 位实例做
-   全枚举，公式独立编写，不导入被测核心来产生期望值；120 个带固定种子的
-   随机实例（含全缺失读段、非均匀权重）逐一核对最优值、全部最优解、严格次优、
-   gap 与每读段归属。
+   全枚举，公式独立编写，不导入被测核心来产生期望值；原接口核对 120 个固定种子
+   随机实例。top-K 在 ≤8 位逐一枚举所有首位 0 串，覆盖零信息读段、同分候选、
+   唯一最优、K=1、K 大于合法解数和预算未证明状态，并核对每个候选的读段归属与
+   修改位置。
 
 ## 输入上限（接口边界）
 
@@ -137,6 +171,8 @@ result = phase_haplotypes(
   模型、读段质量分或重组/距离惩罚。
 - 分支界限为精确算法，最坏情况仍为指数级；上限 18 位是硬边界，超过即拒绝。
 - 全部最优解均物化返回；若位点重叠图高度碎裂，其数量可达 `2^17`。
+- top-K 最多物化 20 个候选；每个候选都带完整读段明细，因此读段很多时返回对象
+  的大小约为 `K × 读段数`。
 
 ## 仓库结构
 

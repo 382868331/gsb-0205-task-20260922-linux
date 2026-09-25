@@ -8,6 +8,8 @@ Observation
     cost of flipping *one* observed allele in that read.
 phase_haplotypes(loci, observations, *, max_nodes=None) -> PhasingResult
     Exact weighted minimum-error-correction phasing.
+top_k_haplotypes(loci, observations, top_k, *, max_nodes=None) -> TopKResult
+    Up to 20 best distinct canonical candidates, ordered for exact ranking.
 
 All arithmetic is exact integer arithmetic; the package never uses floating
 point for costs.
@@ -23,20 +25,26 @@ __all__ = [
     "Observation",
     "PhasingResult",
     "ReadAssignment",
+    "Candidate",
+    "TopKResult",
     "SearchStats",
     "PhasingError",
     "InvalidPhasingInputError",
     "SearchBudgetExhaustedError",
     "phase_haplotypes",
+    "top_k_haplotypes",
     "MAX_LOCI",
     "MAX_OBSERVATIONS",
+    "MAX_TOP_K",
 ]
 
 MAX_LOCI = 18
 MAX_OBSERVATIONS = 200
+MAX_TOP_K = 20
 
 _H0 = 0  # label of the reported haplotype h
 _H1 = 1  # label of the complement 1-h
+_UNSET = object()
 
 
 class PhasingError(ValueError):
@@ -131,6 +139,35 @@ class ReadAssignment:
 
 
 @dataclass(frozen=True)
+class Candidate:
+    """One complete canonical phasing candidate and its per-read evidence."""
+
+    haplotype: tuple[int, ...]
+    complement: tuple[int, ...]
+    cost: int
+    assignments: tuple[ReadAssignment, ...]
+
+
+@dataclass(frozen=True)
+class TopKResult:
+    """Up to K distinct candidates ordered by cost then haplotype.
+
+    When ``completed`` is False, ``candidates`` are feasible incumbents but
+    their ranks are not proven. ``remaining_lower_bound`` is an admissible
+    lower bound for solutions in the unproven remainder; it is deliberately
+    not represented as a second-best gap.
+    """
+
+    top_k: int
+    candidates: tuple[Candidate, ...]
+    completed: bool
+    ranking_proven: bool
+    exhausted: bool
+    remaining_lower_bound: Optional[int]
+    search: SearchStats
+
+
+@dataclass(frozen=True)
 class PhasingResult:
     """Exact phasing result.
 
@@ -168,6 +205,7 @@ def _validate_inputs(
     loci: object,
     observations: object,
     max_nodes: object,
+    top_k: object = _UNSET,
 ) -> tuple[int, list[Observation]]:
     if not _is_plain_int(loci):
         kind = "bool" if isinstance(loci, bool) else type(loci).__name__
@@ -199,6 +237,21 @@ def _validate_inputs(
         raise InvalidPhasingInputError(
             f"observations: at most {MAX_OBSERVATIONS} reads, got {len(observations)}"
         )
+
+    if top_k is not _UNSET:
+        if top_k is None:
+            raise InvalidPhasingInputError(
+                "top_k: expected int, got None"
+            )
+        if not _is_plain_int(top_k):
+            kind = "bool" if isinstance(top_k, bool) else type(top_k).__name__
+            raise InvalidPhasingInputError(
+                f"top_k: expected int, got {kind}; bool is not accepted"
+            )
+        if not 1 <= top_k <= MAX_TOP_K:
+            raise InvalidPhasingInputError(
+                f"top_k: must satisfy 1 <= top_k <= {MAX_TOP_K}, got {top_k}"
+            )
 
     checked: list[Observation] = []
     for i, obs in enumerate(observations):
@@ -343,6 +396,204 @@ def _free_components(
         tuple(group) for root, group in groups.items() if root != root0
     )
     return tuple(free)
+
+
+def _build_assignments(
+    h: tuple[int, ...],
+    obs_list: Sequence[Observation],
+    weights: Sequence[int],
+    covered_sites: Sequence[Sequence[int]],
+) -> tuple[ReadAssignment, ...]:
+    assignments: list[ReadAssignment] = []
+    for i, obs in enumerate(obs_list):
+        flips0 = [k for k in covered_sites[i] if obs.alleles[k] != h[k]]
+        flips1 = [k for k in covered_sites[i] if obs.alleles[k] == h[k]]
+        c0 = weights[i] * len(flips0)
+        c1 = weights[i] * len(flips1)
+        tied = c0 == c1
+        assigned = _H0 if c0 <= c1 else _H1
+        flips_applied = flips0 if assigned == _H0 else flips1
+        assignments.append(
+            ReadAssignment(
+                index=i,
+                assigned=assigned,
+                tied=tied,
+                cost_to_h0=c0,
+                cost_to_h1=c1,
+                flips_to_h0=tuple(flips0),
+                flips_to_h1=tuple(flips1),
+                flips_applied=tuple(flips_applied),
+            )
+        )
+    return tuple(assignments)
+
+
+def top_k_haplotypes(
+    loci: int,
+    observations: Sequence[Observation],
+    top_k: int,
+    *,
+    max_nodes: Optional[int] = None,
+) -> TopKResult:
+    """Return up to ``top_k`` distinct canonical candidates.
+
+    Order is ascending total cost and then lexicographic haplotype. A branch
+    is pruned only when its admissible lower bound is strictly greater than a
+    proven full candidate occupying the Kth slot. Equal bounds are therefore
+    retained.
+    """
+    L, obs_list = _validate_inputs(loci, observations, max_nodes, top_k)
+    n = len(obs_list)
+    weights = [obs.flip_cost for obs in obs_list]
+    covered_sites = [
+        [k for k, allele in enumerate(obs.alleles) if allele is not None]
+        for obs in obs_list
+    ]
+    watch: list[list[tuple[int, int]]] = [[] for _ in range(L)]
+    for i, obs in enumerate(obs_list):
+        for k in covered_sites[i]:
+            watch[k].append((i, obs.alleles[k]))  # type: ignore[arg-type]
+
+    seed0 = _greedy_seed(L, weights, watch, flip_last=False)
+    seed_costs = [_evaluate(seed0, obs_list)]
+    if L >= 2:
+        seed1 = _greedy_seed(L, weights, watch, flip_last=True)
+        seed_costs.append(_evaluate(seed1, obs_list))
+    else:
+        seed1 = None
+
+    found: list[tuple[int, tuple[int, ...]]] = []
+    known: set[tuple[int, ...]] = set()
+    incumbent_updates = 0
+
+    def retain(cost: int, h_candidate: tuple[int, ...]) -> bool:
+        nonlocal incumbent_updates
+        if h_candidate in known:
+            return False
+        if len(found) == top_k:
+            kth_cost, kth_h = found[-1]
+            if cost > kth_cost or (cost == kth_cost and h_candidate >= kth_h):
+                return False
+        updated = True
+        found.append((cost, h_candidate))
+        found.sort(key=lambda item: (item[0], item[1]))
+        if len(found) > top_k:
+            _, removed_h = found.pop()
+            known.discard(removed_h)
+        known.add(h_candidate)
+        if updated:
+            incumbent_updates += 1
+        return True
+
+    retain(seed_costs[0], seed0)
+    if seed1 is not None:
+        retain(seed_costs[-1], seed1)
+
+    mis = [0] * n
+    seen = [0] * n
+    bits = [0] * L
+    nodes_by_depth = [0] * (L + 1)
+    pruned_by_depth = [0] * L
+    nodes_opened = 0
+    leaves_evaluated = 0
+    branches_pruned = 0
+    stopped = False
+
+    def child_delta(k: int, bit: int) -> int:
+        delta = 0
+        for i, allele in watch[k]:
+            m, s, w = mis[i], seen[i], weights[i]
+            old = w * min(m, s - m)
+            new_m = m + (1 if allele != bit else 0)
+            delta += w * min(new_m, s + 1 - new_m) - old
+        return delta
+
+    def commit(k: int, bit: int) -> None:
+        for i, allele in watch[k]:
+            seen[i] += 1
+            if allele != bit:
+                mis[i] += 1
+
+    def rollback(k: int, bit: int) -> None:
+        for i, allele in watch[k]:
+            seen[i] -= 1
+            if allele != bit:
+                mis[i] -= 1
+
+    pending_bounds: list[list[int]] = []
+
+    def dfs(k: int, lb: int) -> Optional[int]:
+        nonlocal nodes_opened, leaves_evaluated, branches_pruned, stopped
+        nodes_opened += 1
+        nodes_by_depth[k] += 1
+        if max_nodes is not None and nodes_opened > max_nodes:
+            stopped = True
+            return lb
+        if k == L:
+            leaves_evaluated += 1
+            retain(lb, tuple(bits))
+            return None
+
+        kth_cost = found[-1][0] if len(found) == top_k else None
+        children = sorted(
+            ((bit, lb + child_delta(k, bit)) for bit in (0, 1)),
+            key=lambda item: (item[1], item[0]),
+        )
+        remaining_children = [child_lb for _, child_lb in children]
+        pending_bounds.append(remaining_children)
+        for bit, child_lb in children:
+            if kth_cost is not None and child_lb > kth_cost:
+                branches_pruned += 1
+                pruned_by_depth[k] += 1
+                remaining_children.remove(child_lb)
+                continue
+            remaining_children.remove(child_lb)
+            commit(k, bit)
+            bits[k] = bit
+            remaining = dfs(k + 1, child_lb)
+            rollback(k, bit)
+            if remaining is not None:
+                queued = [bound for bounds in pending_bounds for bound in bounds]
+                pending_bounds.pop()
+                return min([remaining, *queued]) if queued else remaining
+        pending_bounds.pop()
+        return None
+
+    bits[0] = 0
+    root_lb = child_delta(0, 0)
+    commit(0, 0)
+    remaining_lower_bound = dfs(1, root_lb)
+
+    candidates = tuple(
+        Candidate(
+            haplotype=h,
+            complement=tuple(1 - bit for bit in h),
+            cost=cost,
+            assignments=_build_assignments(h, obs_list, weights, covered_sites),
+        )
+        for cost, h in found
+    )
+    stats = SearchStats(
+        depth=L,
+        budget=max_nodes,
+        completed=not stopped,
+        nodes_opened=nodes_opened,
+        leaves_evaluated=leaves_evaluated,
+        branches_pruned=branches_pruned,
+        incumbent_updates=incumbent_updates,
+        nodes_by_depth=tuple(nodes_by_depth),
+        pruned_by_depth=tuple(pruned_by_depth),
+        seed_costs=tuple(sorted(seed_costs)),
+    )
+    return TopKResult(
+        top_k=top_k,
+        candidates=candidates,
+        completed=not stopped,
+        ranking_proven=not stopped,
+        exhausted=not stopped,
+        remaining_lower_bound=remaining_lower_bound,
+        search=stats,
+    )
 
 
 def phase_haplotypes(
@@ -500,28 +751,6 @@ def phase_haplotypes(
     h = optimal_haplotypes[0]
     complement = tuple(1 - bit for bit in h)
 
-    assignments: list[ReadAssignment] = []
-    for i, obs in enumerate(obs_list):
-        flips0 = [k for k in covered_sites[i] if obs.alleles[k] != h[k]]
-        flips1 = [k for k in covered_sites[i] if obs.alleles[k] == h[k]]
-        c0 = weights[i] * len(flips0)
-        c1 = weights[i] * len(flips1)
-        tied = c0 == c1
-        assigned = _H0 if c0 <= c1 else _H1
-        flips_applied = flips0 if assigned == _H0 else flips1
-        assignments.append(
-            ReadAssignment(
-                index=i,
-                assigned=assigned,
-                tied=tied,
-                cost_to_h0=c0,
-                cost_to_h1=c1,
-                flips_to_h0=tuple(flips0),
-                flips_to_h1=tuple(flips1),
-                flips_applied=tuple(flips_applied),
-            )
-        )
-
     stats = SearchStats(
         depth=L,
         budget=max_nodes,
@@ -541,7 +770,7 @@ def phase_haplotypes(
         optimal_cost=best,  # type: ignore[arg-type]
         second_best_cost=second,
         gap=None if second is None else second - best,  # type: ignore[operator]
-        assignments=tuple(assignments),
+        assignments=_build_assignments(h, obs_list, weights, covered_sites),
         free_components=_free_components(L, obs_list),
         search=stats,
     )

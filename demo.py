@@ -5,6 +5,8 @@ Run:  python demo.py
 
 It performs real branch-and-bound computations (nothing is pre-recorded and
 nothing sleeps) and prints:
+  A0. top-K candidates, including a zero-information tied read;
+  A1. a top-K budget interruption with an unproven-ranking result;
   A. a small hand-built instance with a disconnected fragment, a tied read
      and a fully missing read;
   B. a larger deterministically generated instance with search-state counters;
@@ -24,6 +26,7 @@ from haplophase import (
     Observation,
     SearchBudgetExhaustedError,
     phase_haplotypes,
+    top_k_haplotypes,
 )
 
 
@@ -87,8 +90,69 @@ def show_result(result) -> None:
     print(f"pruned by depth     : {list(s.pruned_by_depth)}")
 
 
+def show_topk(result, limit=5) -> None:
+    print(f"requested K         : {result.top_k} (maximum supported K is 20)")
+    print(
+        "proof state         : "
+        + (
+            "ranking proven and search exhausted"
+            if result.ranking_proven
+            else "ranking NOT proven and search NOT exhausted"
+        )
+    )
+    print(
+        "remaining lower bound: "
+        + ("none - proof complete" if result.remaining_lower_bound is None
+           else str(result.remaining_lower_bound))
+    )
+    s = result.search
+    print(
+        "search state        : "
+        f"nodes opened {s.nodes_opened}, leaves evaluated {s.leaves_evaluated}, "
+        f"branches pruned {s.branches_pruned}"
+    )
+    print("candidates (cost, h; per-read assignments follow):")
+    for rank, candidate in enumerate(result.candidates[:limit], start=1):
+        h = "".join(map(str, candidate.haplotype))
+        print(f"  {rank}. cost={candidate.cost} h={h}")
+        for assignment in candidate.assignments:
+            flips = assignment.flips_applied
+            positions = "none" if not flips else ",".join(
+                str(k + 1) for k in flips
+            )
+            tie = " tied" if assignment.tied else ""
+            print(
+                f"      read {assignment.index} -> {assignment.assigned}{tie}; "
+                f"change positions: {positions}"
+            )
+
+
 def main() -> None:
     # ------------------------------------------------------------------ A
+    show("A0. Top-K: equal-cost canonical candidates, ordered lexicographically")
+    topk_observations = [
+        Observation((0, 1, None, None, None), 1),
+        Observation((None, None, 0, 0, None), 1),
+        Observation((None, None, None, None, None), 2),
+    ]
+    t0 = time.perf_counter()
+    topk_result = top_k_haplotypes(5, topk_observations, 6)
+    dt = time.perf_counter() - t0
+    show_topk(topk_result)
+    print(f"computed in {dt * 1000:.1f} ms; h[0] remains fixed to 0")
+
+    show("A1. Top-K budget interruption: feasible list plus a remaining bound")
+    budgeted_raw = [
+        Observation((0, 0, 0, 0, None), 1),
+        Observation((None, 0, 1, 0, 1), 2),
+    ]
+    budgeted = top_k_haplotypes(5, budgeted_raw, 4, max_nodes=1)
+    show_topk(budgeted, limit=4)
+    print(
+        "This is not a second-best gap: the listed candidates are feasible, "
+        "but their ranks are unproven."
+    )
+
     show("A. Small instance: weighted reads, a disconnected fragment, ambiguity")
     observations = [
         Observation((0, 1, 0, 1, None, None), 1),   # cheap read, one error
