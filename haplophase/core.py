@@ -22,12 +22,14 @@ from typing import Optional, Sequence
 __all__ = [
     "Observation",
     "PhasingResult",
+    "PosteriorResult",
     "ReadAssignment",
     "SearchStats",
     "PhasingError",
     "InvalidPhasingInputError",
     "SearchBudgetExhaustedError",
     "phase_haplotypes",
+    "phase_posterior",
     "MAX_LOCI",
     "MAX_OBSERVATIONS",
 ]
@@ -158,6 +160,39 @@ class PhasingResult:
     assignments: tuple[ReadAssignment, ...]
     free_components: tuple[tuple[int, ...], ...]
     search: SearchStats
+
+
+@dataclass(frozen=True)
+class PosteriorResult:
+    """Boltzmann posterior over the gauge-fixed candidate space.
+
+    The candidate space is the same one used by :func:phase_haplotypes:
+    the component containing locus 0 is enumerated with h[0] = 0 fixed,
+    and every free component contributes *both* of its global flips as
+    distinct candidates (consistent with optimal_haplotypes counting
+    2**len(free_components) optima).  Candidates are weighted by
+    exp(-cost / temperature).
+
+    marginals: marginals[k] is the posterior probability that the
+        canonical haplotype takes allele 1 at locus k.  marginals[0]
+        is exactly 0.0 because of the gauge.
+    log_partition: natural log of the partition function Z (log-sum-exp
+        accumulated, so arbitrarily low temperatures cannot underflow).
+    entropy: posterior Shannon entropy in nats,
+        H = log Z + mean_cost / temperature (additive over the
+        independent connected components).
+    mean_cost: posterior mean of the weighted-MEC cost.
+    temperature: the temperature the posterior was evaluated at (float).
+    components: the connected components of the locus overlap graph that
+        were summed independently; the first one contains locus 0.
+    """
+
+    marginals: tuple[float, ...]
+    log_partition: float
+    entropy: float
+    mean_cost: float
+    temperature: float
+    components: tuple[tuple[int, ...], ...]
 
 
 def _is_plain_int(value: object) -> bool:
@@ -544,4 +579,240 @@ def phase_haplotypes(
         assignments=tuple(assignments),
         free_components=_free_components(L, obs_list),
         search=stats,
+    )
+
+
+def _validate_temperature(temperature: object) -> float:
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+        kind = "bool" if isinstance(temperature, bool) else type(temperature).__name__
+        raise InvalidPhasingInputError(
+            f"temperature: expected a positive number, got {kind}; "
+            "bool is not accepted"
+        )
+    value = float(temperature)
+    if not math.isfinite(value):
+        raise InvalidPhasingInputError(
+            f"temperature: NaN/Infinity is not accepted, got {temperature!r}"
+        )
+    if value <= 0.0:
+        raise InvalidPhasingInputError(
+            f"temperature: must be strictly positive, got {temperature!r}"
+        )
+    return value
+
+
+def _components(
+    loci: int, obs_list: Sequence[Observation]
+) -> tuple[tuple[int, ...], ...]:
+    """All connected components of the locus overlap graph (locus 0 first)."""
+    parent = list(range(loci))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for obs in obs_list:
+        sites = [k for k, allele in enumerate(obs.alleles) if allele is not None]
+        for k in sites[1:]:
+            ra, rb = find(sites[0]), find(k)
+            if ra != rb:
+                parent[rb] = ra
+
+    groups: dict[int, list[int]] = {}
+    for k in range(loci):
+        groups.setdefault(find(k), []).append(k)
+    ordered = sorted(groups.values(), key=lambda g: (0 not in g, g[0]))
+    return tuple(tuple(g) for g in ordered)
+
+
+class _LogSumExp:
+    """Running log(sum(exp(x_i))) with max-shift; never underflows to 0."""
+
+    __slots__ = ("m", "s")
+
+    def __init__(self) -> None:
+        self.m = -math.inf
+        self.s = 0.0
+
+    def add(self, x: float) -> None:
+        if x > self.m:
+            self.s = self.s * math.exp(self.m - x) + 1.0
+            self.m = x
+        else:
+            self.s += math.exp(x - self.m)
+
+    @property
+    def value(self) -> float:
+        return self.m + math.log(self.s)
+
+
+def _component_posterior(
+    sites: tuple[int, ...],
+    gauge_site: Optional[int],
+    reads: list[tuple[list[int], list[int], int]],
+    inv_temp: float,
+) -> tuple[float, list[float], float, float]:
+    """Exact posterior sums for one connected component.
+
+    sites: loci of the component (sorted).
+    gauge_site: locus fixed to 0 (locus 0's component) or None, in which
+        case both global flips are enumerated as distinct candidates.
+    reads: (covered local indices, alleles, weight) per read; every read
+        covers only sites of this component.
+
+    Returns (log Z_c, per-site P(bit=1), mean cost, entropy in nats).
+    Enumerates assignments in binary-reflected Gray-code order so the
+    running exact integer cost is updated incrementally.
+    """
+    s = len(sites)
+    local_of = {site: j for j, site in enumerate(sites)}
+    free_locals = [j for j in range(s) if sites[j] != gauge_site]
+    n_free = len(free_locals)
+
+    # reads touching each local site: (read_idx, allele)
+    watch: list[list[tuple[int, int]]] = [[] for _ in range(s)]
+    covered = [0] * len(reads)
+    weights = [0] * len(reads)
+    for i, (locs, alleles, w) in enumerate(reads):
+        covered[i] = len(locs)
+        weights[i] = w
+        for loc, allele in zip(locs, alleles):
+            watch[loc].append((i, allele))
+
+    mis = [0] * len(reads)
+    bits = [0] * s
+
+    def reset_state() -> int:
+        # state of the all-zero assignment: every allele 1 is a mismatch
+        for i in range(len(reads)):
+            mis[i] = 0
+        for local in range(s):
+            bits[local] = 0
+        for local in range(s):
+            for i, allele in watch[local]:
+                if allele == 1:
+                    mis[i] += 1
+        return sum(read_cost(i) for i in range(len(reads)))
+
+    def read_cost(i: int) -> int:
+        m = mis[i]
+        return weights[i] * min(m, covered[i] - m)
+
+    def flip(local: int, cost: int) -> int:
+        bit = bits[local] ^ 1
+        bits[local] = bit
+        for i, allele in watch[local]:
+            before = read_cost(i)
+            if allele != bit:
+                mis[i] += 1
+            else:
+                mis[i] -= 1
+            cost += read_cost(i) - before
+        return cost
+
+    cost = reset_state()
+    lse = _LogSumExp()
+    lse.add(-cost * inv_temp)
+    n_assign = 1 << n_free
+    for gray_step in range(1, n_assign):
+        lowest = gray_step & (-gray_step)
+        free_bit = lowest.bit_length() - 1
+        cost = flip(free_locals[free_bit], cost)
+        lse.add(-cost * inv_temp)
+    log_z = lse.value
+
+    # second Gray-code pass: normalized weights are <= 1, plain floats are
+    # exact enough and cannot overflow; underflow only rounds a negligible
+    # probability to 0.0.
+    cost = reset_state()
+    prob_one = [0.0] * s
+    mean_cost = 0.0
+
+    def absorb(cost: float) -> None:
+        nonlocal mean_cost
+        p = math.exp(-cost * inv_temp - log_z)
+        mean_cost += p * cost
+        for local in free_locals:
+            if bits[local]:
+                prob_one[local] += p
+
+    absorb(cost)
+    for gray_step in range(1, n_assign):
+        lowest = gray_step & (-gray_step)
+        free_bit = lowest.bit_length() - 1
+        cost = flip(free_locals[free_bit], cost)
+        absorb(cost)
+
+    entropy = log_z + mean_cost * inv_temp
+    return log_z, prob_one, mean_cost, entropy
+
+
+def phase_posterior(
+    loci: int,
+    observations: Sequence[Observation],
+    *,
+    temperature: float,
+) -> PosteriorResult:
+    """Boltzmann posterior of the weighted-MEC objective.
+
+    Every gauge-fixed candidate h is weighted by exp(-cost / temperature).
+    Independent connected components of the locus overlap graph are summed
+    separately and combined in the log domain; the component containing
+    locus 0 keeps the h[0] = 0 gauge, and each free component contributes
+    both of its global flips as distinct candidates (the same multiplicity
+    used for optimal_haplotypes).  Raises InvalidPhasingInputError for
+    contract violations, including a non-positive or non-finite
+    temperature.
+    """
+    temp = _validate_temperature(temperature)
+    L, obs_list = _validate_inputs(loci, observations, None)
+    inv_temp = 1.0 / temp
+
+    components = _components(L, obs_list)
+    comp_of = [0] * L
+    for c, sites in enumerate(components):
+        for k in sites:
+            comp_of[k] = c
+
+    comp_reads: list[list[tuple[list[int], list[int], int]]] = [
+        [] for _ in components
+    ]
+    for obs in obs_list:
+        locs = [k for k, a in enumerate(obs.alleles) if a is not None]
+        if not locs:
+            continue  # zero covered sites: cost 0 for every candidate
+        c = comp_of[locs[0]]
+        local_of = {site: j for j, site in enumerate(components[c])}
+        comp_reads[c].append(
+            (
+                [local_of[k] for k in locs],
+                [obs.alleles[k] for k in locs],  # type: ignore[misc]
+                obs.flip_cost,
+            )
+        )
+
+    marginals = [0.0] * L
+    log_partition = 0.0
+    mean_cost = 0.0
+    entropy = 0.0
+    for c, sites in enumerate(components):
+        gauge_site = 0 if 0 in sites else None
+        log_z, prob_one, mean_c, entropy_c = _component_posterior(
+            sites, gauge_site, comp_reads[c], inv_temp
+        )
+        log_partition += log_z
+        mean_cost += mean_c
+        entropy += entropy_c
+        for site, p in zip(sites, prob_one):
+            marginals[site] = p
+
+    return PosteriorResult(
+        marginals=tuple(marginals),
+        log_partition=log_partition,
+        entropy=entropy,
+        mean_cost=mean_cost,
+        temperature=temp,
+        components=components,
     )

@@ -11,10 +11,12 @@ from .core import (
     Observation,
     PhasingError,
     PhasingResult,
+    PosteriorResult,
     ReadAssignment,
     SearchBudgetExhaustedError,
     SearchStats,
     phase_haplotypes,
+    phase_posterior,
 )
 
 __all__ = [
@@ -24,10 +26,12 @@ __all__ = [
     "Observation",
     "PhasingError",
     "PhasingResult",
+    "PosteriorResult",
     "ReadAssignment",
     "SearchBudgetExhaustedError",
     "SearchStats",
     "phase_haplotypes",
+    "phase_posterior",
 ]
 
 __version__ = "1.0.0"

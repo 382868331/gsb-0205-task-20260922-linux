@@ -7,6 +7,7 @@ all 2**(loci-1) canonical candidates (loci <= 10) with plain itertools.
 
 from __future__ import annotations
 
+import math
 import random
 from itertools import product
 
@@ -75,3 +76,32 @@ def random_cases(seed=20260923, count=120):
         loci = rng.randint(1, MAX_REFERENCE_LOCI)
         cases.append((loci, random_instance(rng, loci)))
     return cases
+
+
+def brute_force_posterior(loci, raw_reads, temperature):
+    """Independent Boltzmann posterior over all 2**(loci-1) canonical
+    candidates (h[0] = 0).  Returns (marginals, log_z, entropy, mean_cost).
+    Deliberately a flat enumeration with its own log-sum-exp; it shares no
+    code path with the component-wise implementation under test."""
+    temp = float(temperature)
+    terms = []  # (neg_cost_over_temp, h, cost)
+    peak = None
+    for bits in product((0, 1), repeat=loci):
+        if bits[0] != 0:
+            continue
+        cost = reference_cost(bits, raw_reads)
+        x = -cost / temp
+        terms.append((x, bits, cost))
+        if peak is None or x > peak:
+            peak = x
+    z_scaled = sum(math.exp(x - peak) for x, _, _ in terms)
+    log_z = peak + math.log(z_scaled)
+    marginals = []
+    for k in range(loci):
+        num = sum(
+            math.exp(x - log_z) for x, h, _ in terms if h[k] == 1
+        )
+        marginals.append(num)
+    mean_cost = sum(math.exp(x - log_z) * c for x, _, c in terms)
+    entropy = log_z + mean_cost / temp
+    return tuple(marginals), log_z, entropy, mean_cost

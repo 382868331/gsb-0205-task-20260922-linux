@@ -3,25 +3,42 @@
 离线、无第三方依赖的**加权最小纠错（weighted MEC）单倍型定相**库。对二元杂合位点
 和带缺失的片段读段，用**分支界限（branch and bound）**精确求互补单倍型对
 `h` 与 `1-h`，固定 `h[0] = 0` 消除互补对称；不是逐位独立投票。
+另提供 **Boltzmann 后验入口**：候选 `h` 按 `exp(-cost/temperature)` 加权，
+报告每个位点取 1 的边缘概率、归一常数对数与整体熵（见下文“后验接口”）。
 
 - Python：**3.14.7**（任何 3.10+ 也可运行，开发与验收环境为 3.14.7）
 - 依赖：**仅标准库**，安装 Python 后无需 `pip install` 任何东西
 - 网络 / 账号 / 密钥 / 数据库 / Docker：全部不需要
-- 全部计算为**精确整数运算，不使用任何浮点**（因此不存在浮点误差口径问题；
-  唯一接受浮点的路径是输入校验——NaN/Infinity/普通 float 一律拒绝）
+- 最优定相（`phase_haplotypes`）全部计算为**精确整数运算，不使用任何浮点**；
+  Boltzmann 后验（`phase_posterior`）是唯一返回浮点的路径，其误差口径见
+  “后验接口”一节；输入校验对两条路径一致——NaN/Infinity/普通 float 代价一律拒绝
+
+## 环境准备（venv）
+
+只需要 Python 3.14.7 本体，无任何第三方依赖；venv 仅用于隔离解释器：
+
+```bash
+python3.14 -m venv .venv        # 或任何 python3 >= 3.10
+source .venv/bin/activate
+# 无需 pip install：requirements.txt 为空（仅标准库）
+```
 
 ## 准确命令
 
 ```bash
-# 必要测试（含 ≤10 位独立全枚举参考，120 个随机用例）
+# 必要测试（含 ≤10 位独立全枚举参考，120 个随机用例 + 后验独立枚举对照）
 python -m unittest discover -s tests -v
 
 # 固定输入演示：一个正常定相结果 + 实际触发的输入拒绝 + 预算耗尽异常
 python demo.py
+
+# 后验演示：最优解相同但后验不确定性不同的两组数据 + 非法温度拒绝
+python demo_iteration.py
 ```
 
 演示真实执行分支界限并打印搜索计数，不 sleep、不预录结果，在普通笔记本上
-远低于 8 秒（实测约 0.1 秒）。
+远低于 8 秒（实测约 0.1 秒）；后验演示现场枚举连通块并求和，实测远低于
+90 秒（约 0.05 秒）。
 
 ## 问题定义
 
@@ -96,6 +113,51 @@ result = phase_haplotypes(
 - **预算耗尽 ≠ 证明无解**：本问题任何通过校验的实例都可行（候选空间有限且全部
   容许），不存在“无解”；预算异常只表示“未证完”。去掉 `max_nodes` 重跑即可。
 
+## 后验接口（Boltzmann 加权）
+
+```python
+from haplophase import phase_posterior
+
+post = phase_posterior(
+    loci,
+    observations,          # 与 phase_haplotypes 完全相同的契约与校验
+    *,
+    temperature=1.0,       # 必须为正数；int/float 均可
+)
+```
+
+候选空间与最优定相完全一致：含位点 0 的连通块固定 `h[0] = 0`，每个自由块
+（不含位点 0 的连通分量）的两种整体翻转都算作**不同候选**——与
+`optimal_haplotypes` 数出 `2^自由块数` 个最优解是同一套计数，不存在
+“枚举两份再随手除 2”。每个候选权重为 `exp(-cost/temperature)`。
+
+返回冻结 dataclass `PosteriorResult`：
+
+| 字段 | 含义 |
+|---|---|
+| `marginals` | `marginals[k]` = 后验下 `h[k]=1` 的概率；`marginals[0]` 恒为 0.0（规范固定） |
+| `log_partition` | 归一常数 Z 的自然对数（log-sum-exp 累计，低温不下溢） |
+| `entropy` | 后验香农熵（nats），`H = log Z + mean_cost/temperature` |
+| `mean_cost` | 后验平均代价 |
+| `temperature` | 实际使用的温度（float） |
+| `components` | 参与独立求和的连通块（第一个含位点 0） |
+
+实现要点：
+
+- **分块独立求和**：读段覆盖的位点必落在同一连通块，总代价按块分解，
+  `log Z`、熵、平均代价按块相加，边缘概率按块独立计算。
+- **对数域累计**：配分函数用 max-shift 的 log-sum-exp；第二遍直接累计
+  `exp(-cost/T - log Z) ≤ 1` 的归一化权重，任意低的温度都不会出现
+  0/0 或下溢成零除。
+- **Gray 码枚举**：每块按二进制反射 Gray 码枚举，翻一位只增量更新涉及
+  该位点的读段，运行代价保持精确整数。
+- **温度契约**：`temperature` 必须为正且有限；`0`、负数、`NaN`、
+  `Infinity`、`bool`、非数值类型一律抛 `InvalidPhasingInputError`。
+- **浮点口径**：后验是本库唯一返回浮点的路径。边缘概率与熵是 IEEE 双
+  精度结果；极低温（代价间隔/温度 ≫ 1）下指数相消带来约
+  `Δcost/T · 1e-16` 量级的指数误差，测试按此口径设定精度，不以宽容差
+  掩盖边界错误。
+
 ## 算法与设计取舍
 
 1. **对称固定**：`h[0] = 0`，搜索空间 `2^(L−1)`（上限 2^17）。
@@ -137,14 +199,22 @@ result = phase_haplotypes(
   模型、读段质量分或重组/距离惩罚。
 - 分支界限为精确算法，最坏情况仍为指数级；上限 18 位是硬边界，超过即拒绝。
 - 全部最优解均物化返回；若位点重叠图高度碎裂，其数量可达 `2^17`。
+- 后验温度是**建模旋钮，未经真实校准**：不声称对应任何真实测序错误率
+  或覆盖度概率模型；它只把加权 MEC 目标转成 Boltzmann 权重。
+- 后验按连通块精确枚举，单块最坏 `2^17` 个赋值（Gray 码增量求值，
+  两遍）；与分支界限同为指数级最坏情况，18 位硬边界同样适用。
+- 自由块的两种整体翻转计为不同候选（与最优解计数一致），因此自由块
+  内每个位点的边缘概率恒为 0.5，每自由块向熵贡献至多 `log 2`。
 
 ## 仓库结构
 
 ```
 haplophase/__init__.py   # 公共导出
-haplophase/core.py       # 校验、分支界限、连通分量、结果组装
+haplophase/core.py       # 校验、分支界限、连通分量、后验分块求和、结果组装
 tests/reference.py       # 独立全枚举参考（不调用被测核心求期望值）
-tests/test_phase.py      # 必要测试
+tests/test_phase.py      # 最优定相必要测试
+tests/test_posterior.py  # 后验必要测试（独立枚举对照 + 结构 + 异常路径）
 demo.py                  # 固定输入演示（正常结果 + 拒绝/异常边界）
+demo_iteration.py        # 后验演示（同最优解、不同不确定性 + 非法温度）
 README.md
 ```
