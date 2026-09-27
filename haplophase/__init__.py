@@ -9,11 +9,13 @@ from .core import (
     MAX_OBSERVATIONS,
     InvalidPhasingInputError,
     Observation,
+    OptimalBatch,
     PhasingError,
     PhasingResult,
     ReadAssignment,
     SearchBudgetExhaustedError,
     SearchStats,
+    optimal_haplotype_batch,
     phase_haplotypes,
 )
 
@@ -22,11 +24,13 @@ __all__ = [
     "MAX_OBSERVATIONS",
     "InvalidPhasingInputError",
     "Observation",
+    "OptimalBatch",
     "PhasingError",
     "PhasingResult",
     "ReadAssignment",
     "SearchBudgetExhaustedError",
     "SearchStats",
+    "optimal_haplotype_batch",
     "phase_haplotypes",
 ]
 

@@ -8,6 +8,12 @@ Observation
     cost of flipping *one* observed allele in that read.
 phase_haplotypes(loci, observations, *, max_nodes=None) -> PhasingResult
     Exact weighted minimum-error-correction phasing.
+optimal_haplotype_batch(loci, observations, *, batch_size, max_nodes=None,
+                        cursor=None) -> OptimalBatch
+    Batched enumeration of *all* optimal haplotypes in a stable
+    lexicographic order: the first call proves the optimal cost, every call
+    returns at most ``batch_size`` solutions plus an opaque continuation
+    cursor, and no call materializes the whole optimal set internally.
 
 All arithmetic is exact integer arithmetic; the package never uses floating
 point for costs.
@@ -15,6 +21,7 @@ point for costs.
 
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import dataclass
 from typing import Optional, Sequence
@@ -22,12 +29,14 @@ from typing import Optional, Sequence
 __all__ = [
     "Observation",
     "PhasingResult",
+    "OptimalBatch",
     "ReadAssignment",
     "SearchStats",
     "PhasingError",
     "InvalidPhasingInputError",
     "SearchBudgetExhaustedError",
     "phase_haplotypes",
+    "optimal_haplotype_batch",
     "MAX_LOCI",
     "MAX_OBSERVATIONS",
 ]
@@ -157,6 +166,35 @@ class PhasingResult:
     gap: Optional[int]
     assignments: tuple[ReadAssignment, ...]
     free_components: tuple[tuple[int, ...], ...]
+    search: SearchStats
+
+
+@dataclass(frozen=True)
+class OptimalBatch:
+    """One batch of optimal haplotypes from a batched enumeration.
+
+    optimal_cost: the proven optimal total cost (established by the first
+        call of a batch sequence and carried by the cursor afterwards).
+    haplotypes: up to ``batch_size`` distinct optimal h (h[0] = 0), in
+        stable ascending lexicographic order; complementary duplicates are
+        already removed by the h[0] = 0 symmetry fixing, exactly as in
+        ``PhasingResult.optimal_haplotypes``.
+    next_cursor: opaque continuation token for the next call, or None when
+        the enumeration is complete. A cursor is only valid for the exact
+        same inputs and options (loci, observations, batch_size, max_nodes);
+        anything else is rejected with InvalidPhasingInputError.
+    exhausted: True iff the search ran to completion and every optimal
+        haplotype has now been delivered. It is never set while the search
+        is unfinished (a budget stop raises SearchBudgetExhaustedError
+        instead of reporting a partial enumeration as complete).
+    search: observable state of this call's search (proof pass plus
+        enumeration pass on the first call, enumeration only afterwards).
+    """
+
+    optimal_cost: int
+    haplotypes: tuple[tuple[int, ...], ...]
+    next_cursor: Optional[str]
+    exhausted: bool
     search: SearchStats
 
 
@@ -345,20 +383,9 @@ def _free_components(
     return tuple(free)
 
 
-def phase_haplotypes(
-    loci: int,
-    observations: Sequence[Observation],
-    *,
-    max_nodes: Optional[int] = None,
-) -> PhasingResult:
-    """Phase diploid haplotypes by exact weighted-MEC branch and bound.
-
-    Raises InvalidPhasingInputError for contract violations (with a message
-    pinpointing the offending argument) and SearchBudgetExhaustedError if the
-    optional node budget is exhausted before optimality is proven.
-    """
-    L, obs_list = _validate_inputs(loci, observations, max_nodes)
-    n = len(obs_list)
+def _prepare_search_structures(
+    L: int, obs_list: Sequence[Observation]
+) -> tuple[list[int], list[list[int]], list[list[tuple[int, int]]]]:
     weights = [obs.flip_cost for obs in obs_list]
     covered_sites = [
         [k for k, allele in enumerate(obs.alleles) if allele is not None]
@@ -368,6 +395,45 @@ def phase_haplotypes(
     for i, obs in enumerate(obs_list):
         for k in covered_sites[i]:
             watch[k].append((i, obs.alleles[k]))  # type: ignore[arg-type]
+    return weights, covered_sites, watch
+
+
+def _new_counters(L: int) -> dict:
+    return {
+        "nodes_opened": 0,
+        "leaves_evaluated": 0,
+        "branches_pruned": 0,
+        "incumbent_updates": 0,
+        "nodes_by_depth": [0] * (L + 1),
+        "pruned_by_depth": [0] * L,
+    }
+
+
+def _run_branch_and_bound(
+    L: int,
+    obs_list: Sequence[Observation],
+    weights: list[int],
+    watch: list[list[tuple[int, int]]],
+    max_nodes: Optional[int],
+    collect: bool,
+    counters: dict,
+) -> tuple[
+    Optional[int],
+    Optional[int],
+    list[tuple[int, ...]],
+    Optional[tuple[int, ...]],
+    tuple[int, ...],
+    bool,
+]:
+    """Exact branch and bound over the h[0] = 0 candidate space.
+
+    Proves the best and the strictly-second distinct cost. When ``collect``
+    is true every optimal leaf is gathered; otherwise no solution list is
+    materialized (the batched enumeration relies on this so it never
+    pre-materializes all optima). ``counters`` is updated in place so
+    several invocations can share one node budget.
+    """
+    n = len(weights)
 
     # ---- incumbent seeds (feasible candidates; never prune against an
     # unproven bound that could hide an optimum: a seed cost is a true cost) --
@@ -383,17 +449,16 @@ def phase_haplotypes(
     best: Optional[int] = None
     second: Optional[int] = None
     incumbent_h: Optional[tuple[int, ...]] = None
-    incumbent_updates = 0
 
     def absorb(cost: int, h_candidate: Optional[tuple[int, ...]] = None) -> None:
-        nonlocal best, second, incumbent_h, incumbent_updates
+        nonlocal best, second, incumbent_h
         if best is None or cost < best:
             if best is not None:
                 second = best if second is None else min(second, best)
             best = cost
             if h_candidate is not None:
                 incumbent_h = h_candidate
-            incumbent_updates += 1
+            counters["incumbent_updates"] += 1
         elif cost > best and (second is None or cost < second):
             second = cost
 
@@ -408,11 +473,6 @@ def phase_haplotypes(
     seen = [0] * n      # observed sites among decided loci, per read
     bits = [0] * L
     optimal: list[tuple[int, ...]] = []
-    nodes_by_depth = [0] * (L + 1)
-    pruned_by_depth = [0] * L
-    nodes_opened = 0
-    leaves_evaluated = 0
-    branches_pruned = 0
     stopped = False
 
     def child_delta(k: int, bit: int) -> int:
@@ -440,23 +500,24 @@ def phase_haplotypes(
                 mis[i] -= 1
 
     def dfs(k: int, lb: int) -> None:
-        nonlocal nodes_opened, leaves_evaluated, branches_pruned, stopped
-        nodes_opened += 1
-        nodes_by_depth[k] += 1
-        if max_nodes is not None and nodes_opened > max_nodes:
+        nonlocal stopped
+        counters["nodes_opened"] += 1
+        counters["nodes_by_depth"][k] += 1
+        if max_nodes is not None and counters["nodes_opened"] > max_nodes:
             stopped = True
             return
         if k == L:
-            leaves_evaluated += 1
+            counters["leaves_evaluated"] += 1
             cost = lb  # all observed sites decided -> bound is exact
             prev_best = best
             candidate = tuple(bits)
             absorb(cost, candidate)
-            if prev_best is None or cost < prev_best:
-                optimal.clear()
-                optimal.append(candidate)
-            elif cost == best:
-                optimal.append(candidate)
+            if collect:
+                if prev_best is None or cost < prev_best:
+                    optimal.clear()
+                    optimal.append(candidate)
+                elif cost == best:
+                    optimal.append(candidate)
             return
 
         # admissible threshold: a child whose prefix LB already exceeds the
@@ -469,8 +530,8 @@ def phase_haplotypes(
         )
         for bit, child_lb in children:
             if threshold is not None and child_lb > threshold:
-                branches_pruned += 1
-                pruned_by_depth[k] += 1
+                counters["branches_pruned"] += 1
+                counters["pruned_by_depth"][k] += 1
                 continue
             commit(k, bit)
             bits[k] = bit
@@ -483,14 +544,36 @@ def phase_haplotypes(
     root_lb = child_delta(0, 0)
     commit(0, 0)
     dfs(1, root_lb)
+    return best, second, optimal, incumbent_h, tuple(sorted(seed_costs)), stopped
 
+
+def phase_haplotypes(
+    loci: int,
+    observations: Sequence[Observation],
+    *,
+    max_nodes: Optional[int] = None,
+) -> PhasingResult:
+    """Phase diploid haplotypes by exact weighted-MEC branch and bound.
+
+    Raises InvalidPhasingInputError for contract violations (with a message
+    pinpointing the offending argument) and SearchBudgetExhaustedError if the
+    optional node budget is exhausted before optimality is proven.
+    """
+    L, obs_list = _validate_inputs(loci, observations, max_nodes)
+    weights, covered_sites, watch = _prepare_search_structures(L, obs_list)
+    counters = _new_counters(L)
+    best, second, optimal, incumbent_h, seed_costs, stopped = (
+        _run_branch_and_bound(
+            L, obs_list, weights, watch, max_nodes, True, counters
+        )
+    )
     if stopped:
         raise SearchBudgetExhaustedError(
-            f"search budget exhausted after {nodes_opened} nodes "
+            f"search budget exhausted after {counters['nodes_opened']} nodes "
             f"(budget={max_nodes}); optimality not proven",
             budget=max_nodes,  # type: ignore[arg-type]
-            nodes_opened=nodes_opened,
-            leaves_evaluated=leaves_evaluated,
+            nodes_opened=counters["nodes_opened"],  # type: ignore[arg-type]
+            leaves_evaluated=counters["leaves_evaluated"],  # type: ignore[arg-type]
             best_cost=best,
             best_haplotype=incumbent_h,
         )
@@ -526,13 +609,13 @@ def phase_haplotypes(
         depth=L,
         budget=max_nodes,
         completed=True,
-        nodes_opened=nodes_opened,
-        leaves_evaluated=leaves_evaluated,
-        branches_pruned=branches_pruned,
-        incumbent_updates=incumbent_updates,
-        nodes_by_depth=tuple(nodes_by_depth),
-        pruned_by_depth=tuple(pruned_by_depth),
-        seed_costs=tuple(sorted(seed_costs)),
+        nodes_opened=counters["nodes_opened"],
+        leaves_evaluated=counters["leaves_evaluated"],
+        branches_pruned=counters["branches_pruned"],
+        incumbent_updates=counters["incumbent_updates"],
+        nodes_by_depth=tuple(counters["nodes_by_depth"]),
+        pruned_by_depth=tuple(counters["pruned_by_depth"]),
+        seed_costs=seed_costs,
     )
     return PhasingResult(
         haplotype=h,
@@ -543,5 +626,282 @@ def phase_haplotypes(
         gap=None if second is None else second - best,  # type: ignore[operator]
         assignments=tuple(assignments),
         free_components=_free_components(L, obs_list),
+        search=stats,
+    )
+
+_CURSOR_PREFIX = "hpb1"
+
+
+def _batch_fingerprint(
+    L: int, obs_list: Sequence[Observation], batch_size: int
+) -> str:
+    """Stable fingerprint of everything a continuation cursor depends on.
+
+    Any change to the inputs (loci, observations) or to the result-shaping
+    option batch_size yields a different fingerprint, which makes
+    previously issued cursors invalid. max_nodes is deliberately excluded:
+    it is a per-call safety budget, not part of the problem, so the same
+    query may be continued with a different budget.
+    """
+    digest = hashlib.sha256()
+    digest.update(repr((L, batch_size)).encode("utf-8"))
+    for obs in obs_list:
+        digest.update(repr((tuple(obs.alleles), obs.flip_cost)).encode("utf-8"))
+    return digest.hexdigest()[:16]
+
+
+def _encode_cursor(
+    fingerprint: str, optimal_cost: int, last_haplotype: tuple[int, ...]
+) -> str:
+    bits = "".join(str(bit) for bit in last_haplotype)
+    return f"{_CURSOR_PREFIX}:{fingerprint}:{optimal_cost}:{bits}"
+
+
+def _decode_cursor(
+    cursor: object, fingerprint: str, L: int
+) -> tuple[int, tuple[int, ...]]:
+    if not isinstance(cursor, str):
+        raise InvalidPhasingInputError(
+            f"cursor: expected a next_cursor string, got {type(cursor).__name__}"
+        )
+    parts = cursor.split(":")
+    if len(parts) != 4 or parts[0] != _CURSOR_PREFIX:
+        raise InvalidPhasingInputError(
+            "cursor: malformed continuation token; pass the next_cursor value "
+            "returned by a previous optimal_haplotype_batch call"
+        )
+    if parts[1] != fingerprint:
+        raise InvalidPhasingInputError(
+            "cursor: inputs or options changed since this cursor was issued; "
+            "the continuation is invalid, start a new batch sequence"
+        )
+    try:
+        optimal_cost = int(parts[2])
+    except ValueError:
+        raise InvalidPhasingInputError(
+            "cursor: malformed continuation token (cost field)"
+        ) from None
+    bits = parts[3]
+    if (
+        len(bits) != L
+        or any(ch not in "01" for ch in bits)
+        or bits[0] != "0"
+    ):
+        raise InvalidPhasingInputError(
+            "cursor: malformed continuation token (haplotype field)"
+        )
+    return optimal_cost, tuple(int(ch) for ch in bits)
+
+
+def _enumerate_lex(
+    L: int,
+    weights: list[int],
+    watch: list[list[tuple[int, int]]],
+    optimal_cost: int,
+    skip_below: Optional[tuple[int, ...]],
+    fetch_limit: int,
+    max_nodes: Optional[int],
+    counters: dict,
+) -> tuple[list[tuple[int, ...]], bool, bool]:
+    """Lexicographic DFS collecting up to ``fetch_limit`` optimal leaves.
+
+    Only subtrees whose admissible lower bound stays <= ``optimal_cost`` are
+    entered; leaves are visited in ascending lexicographic order; leaves
+    <= ``skip_below`` (already delivered) are skipped, whole subtrees at a
+    time. At most ``fetch_limit`` leaves are kept, so the full optimal set
+    is never materialized. Returns (results, stopped, hit_limit).
+    """
+    n = len(weights)
+    mis = [0] * n
+    seen = [0] * n
+    bits = [0] * L
+    results: list[tuple[int, ...]] = []
+    stopped = False
+    hit_limit = False
+
+    def child_delta(k: int, bit: int) -> int:
+        delta = 0
+        for i, allele in watch[k]:
+            m, s, w = mis[i], seen[i], weights[i]
+            old = w * min(m, s - m)
+            new_m = m + (1 if allele != bit else 0)
+            delta += w * min(new_m, s + 1 - new_m) - old
+        return delta
+
+    def commit(k: int, bit: int) -> None:
+        for i, allele in watch[k]:
+            seen[i] += 1
+            if allele != bit:
+                mis[i] += 1
+
+    def rollback(k: int, bit: int) -> None:
+        for i, allele in watch[k]:
+            seen[i] -= 1
+            if allele != bit:
+                mis[i] -= 1
+
+    def dfs(k: int, lb: int) -> None:
+        nonlocal stopped, hit_limit
+        counters["nodes_opened"] += 1
+        counters["nodes_by_depth"][k] += 1
+        if max_nodes is not None and counters["nodes_opened"] > max_nodes:
+            stopped = True
+            return
+        if k == L:
+            counters["leaves_evaluated"] += 1
+            candidate = tuple(bits)
+            if lb == optimal_cost and (
+                skip_below is None or candidate > skip_below
+            ):
+                results.append(candidate)
+                if len(results) >= fetch_limit:
+                    hit_limit = True
+            return
+        if skip_below is not None and tuple(bits[:k]) < skip_below[:k]:
+            # every leaf below this prefix is lexicographically smaller than
+            # the last delivered haplotype: already delivered, skip it all.
+            counters["branches_pruned"] += 1
+            counters["pruned_by_depth"][k] += 1
+            return
+        for bit in (0, 1):
+            child_lb = lb + child_delta(k, bit)
+            if child_lb > optimal_cost:
+                counters["branches_pruned"] += 1
+                counters["pruned_by_depth"][k] += 1
+                continue
+            commit(k, bit)
+            bits[k] = bit
+            dfs(k + 1, child_lb)
+            rollback(k, bit)
+            if stopped or hit_limit:
+                return
+
+    bits[0] = 0
+    root_lb = child_delta(0, 0)
+    commit(0, 0)
+    dfs(1, root_lb)
+    return results, stopped, hit_limit
+
+
+def optimal_haplotype_batch(
+    loci: int,
+    observations: Sequence[Observation],
+    *,
+    batch_size: int,
+    max_nodes: Optional[int] = None,
+    cursor: Optional[str] = None,
+) -> OptimalBatch:
+    """Enumerate all optimal haplotypes in stable batches.
+
+    The first call (``cursor=None``) proves the optimal cost with the exact
+    branch and bound and returns the first batch; every later call passes
+    the previous ``next_cursor`` and receives the next batch. Batches are
+    delivered in ascending lexicographic order over h (h[0] = 0), so the
+    concatenation of all batches contains every optimal haplotype exactly
+    once - no duplicates, no omissions - with complementary symmetry
+    removed exactly as in ``phase_haplotypes``.
+
+    The full optimal set is never materialized internally: each call keeps
+    at most ``batch_size + 1`` candidates in memory. ``exhausted`` (and
+    ``search.completed``) is True only when the enumeration search ran to
+    completion; an unfinished search is never reported as complete - if
+    ``max_nodes`` runs out first, SearchBudgetExhaustedError is raised
+    instead and no partial batch is delivered. The node budget covers the
+    whole call (proof pass plus enumeration pass).
+
+    A cursor is bound to the exact inputs and result-shaping options it was
+    issued with (loci, observations, batch_size); using it after any of
+    them changed raises InvalidPhasingInputError. max_nodes is a per-call
+    safety budget and may be changed between calls without invalidating the
+    continuation.
+    """
+    if not _is_plain_int(batch_size):
+        kind = "bool" if isinstance(batch_size, bool) else type(batch_size).__name__
+        raise InvalidPhasingInputError(
+            f"batch_size: expected int, got {kind}; bool is not accepted"
+        )
+    if batch_size < 1:
+        raise InvalidPhasingInputError(
+            f"batch_size: must be a positive integer >= 1, got {batch_size}"
+        )
+    L, obs_list = _validate_inputs(loci, observations, max_nodes)
+    fingerprint = _batch_fingerprint(L, obs_list, batch_size)
+    if cursor is None:
+        proven_cost: Optional[int] = None
+        skip_below: Optional[tuple[int, ...]] = None
+    else:
+        proven_cost, skip_below = _decode_cursor(cursor, fingerprint, L)
+
+    weights, _covered, watch = _prepare_search_structures(L, obs_list)
+    counters = _new_counters(L)
+    seed_costs: tuple[int, ...] = ()
+    if proven_cost is None:
+        best, _second, _opt, incumbent_h, seed_costs, stopped = (
+            _run_branch_and_bound(
+                L, obs_list, weights, watch, max_nodes, False, counters
+            )
+        )
+        if stopped:
+            raise SearchBudgetExhaustedError(
+                f"search budget exhausted after {counters['nodes_opened']} "
+                f"nodes (budget={max_nodes}); optimal cost not yet proven",
+                budget=max_nodes,  # type: ignore[arg-type]
+                nodes_opened=counters["nodes_opened"],  # type: ignore[arg-type]
+                leaves_evaluated=counters["leaves_evaluated"],  # type: ignore[arg-type]
+                best_cost=best,
+                best_haplotype=incumbent_h,
+            )
+        proven_cost = best
+
+    results, stopped, _hit_limit = _enumerate_lex(
+        L,
+        weights,
+        watch,
+        proven_cost,  # type: ignore[arg-type]
+        skip_below,
+        batch_size + 1,
+        max_nodes,
+        counters,
+    )
+    if stopped:
+        raise SearchBudgetExhaustedError(
+            f"search budget exhausted after {counters['nodes_opened']} nodes "
+            f"(budget={max_nodes}); enumeration incomplete, no batch delivered",
+            budget=max_nodes,  # type: ignore[arg-type]
+            nodes_opened=counters["nodes_opened"],  # type: ignore[arg-type]
+            leaves_evaluated=counters["leaves_evaluated"],  # type: ignore[arg-type]
+            best_cost=proven_cost,
+            best_haplotype=results[0] if results else None,
+        )
+
+    if len(results) > batch_size:
+        delivered = tuple(results[:batch_size])
+        exhausted = False
+        next_cursor: Optional[str] = _encode_cursor(
+            fingerprint, proven_cost, results[batch_size - 1]  # type: ignore[arg-type]
+        )
+    else:
+        # the enumeration search ran to completion: nothing remains
+        delivered = tuple(results)
+        exhausted = True
+        next_cursor = None
+
+    stats = SearchStats(
+        depth=L,
+        budget=max_nodes,
+        completed=exhausted,
+        nodes_opened=counters["nodes_opened"],
+        leaves_evaluated=counters["leaves_evaluated"],
+        branches_pruned=counters["branches_pruned"],
+        incumbent_updates=counters["incumbent_updates"],
+        nodes_by_depth=tuple(counters["nodes_by_depth"]),
+        pruned_by_depth=tuple(counters["pruned_by_depth"]),
+        seed_costs=seed_costs,
+    )
+    return OptimalBatch(
+        optimal_cost=proven_cost,  # type: ignore[arg-type]
+        haplotypes=delivered,
+        next_cursor=next_cursor,
+        exhausted=exhausted,
         search=stats,
     )

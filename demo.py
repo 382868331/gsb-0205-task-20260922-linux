@@ -22,7 +22,9 @@ import time
 from haplophase import (
     InvalidPhasingInputError,
     Observation,
+    OptimalBatch,
     SearchBudgetExhaustedError,
+    optimal_haplotype_batch,
     phase_haplotypes,
 )
 
@@ -132,6 +134,28 @@ def main() -> None:
     dt = time.perf_counter() - t0
     show_result(result_b)
     print(f"computed in {dt * 1000:.1f} ms over a space of 2**14 candidates")
+
+    # ------------------------------------------------------------------ B2
+    show("B2. Batched claiming of tied-optimal haplotypes (5 loci, no reads)")
+    print("With no observations every admissible h is optimal: 2**4 = 16")
+    print("solutions. They are claimed in batches of 5 in stable lexicographic")
+    print("order; the full set is never materialized internally.")
+    cursor = None
+    claimed_total = 0
+    while True:
+        batch: OptimalBatch = optimal_haplotype_batch(
+            5, [], batch_size=5, cursor=cursor
+        )
+        shown = ", ".join("".join(map(str, h)) for h in batch.haplotypes)
+        print(
+            f"  batch: cost={batch.optimal_cost} -> [{shown}] "
+            f"({len(batch.haplotypes)} items, exhausted={batch.exhausted})"
+        )
+        claimed_total += len(batch.haplotypes)
+        if batch.exhausted:
+            break
+        cursor = batch.next_cursor
+    print(f"claimed {claimed_total} distinct optimal h in total; no dup, none missed")
 
     # ------------------------------------------------------------------ C
     show("C1. Rejected boundary: NaN allele (locatable error, no silent fix)")

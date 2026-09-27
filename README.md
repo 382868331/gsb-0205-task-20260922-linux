@@ -84,6 +84,50 @@ result = phase_haplotypes(
 `leaves_evaluated`、`branches_pruned`、`incumbent_updates`、
 `nodes_by_depth`、`pruned_by_depth`、`seed_costs`（两个确定性初始解代价）。
 
+### 分批领取全部最优解
+
+并列最优解可能多达 `2^17` 个，一次物化会占用较多内存，因此提供分批接口：
+
+```python
+from haplophase import optimal_haplotype_batch
+
+cursor = None
+while True:
+    batch = optimal_haplotype_batch(
+        loci, observations,
+        batch_size=100,          # 正整数，bool 拒绝
+        max_nodes=None,          # 可选，单次调用的节点预算
+        cursor=cursor,           # 首批传 None
+    )
+    ...  # 处理 batch.haplotypes
+    if batch.exhausted:
+        break
+    cursor = batch.next_cursor
+```
+
+返回冻结 dataclass `OptimalBatch`：
+
+| 字段 | 含义 |
+|---|---|
+| `optimal_cost` | 最优总代价；首批调用先用完整分支界限证明该值，之后由游标携带 |
+| `haplotypes` | 本批最优 `h`（至多 `batch_size` 个，`h[0]=0` 去互补对称，与一次性接口一致） |
+| `next_cursor` | 续取游标（不透明字符串）；枚举完毕时为 `None` |
+| `exhausted` | 仅当枚举搜索真正跑完才为 `True`；未完成的搜索绝不标记为完毕 |
+| `search` | 本次调用的 `SearchStats`（首批含证明过程，后续批只有枚举过程） |
+
+契约要点：
+
+- **稳定顺序**：所有批按字典序升序拼接后，与 `PhasingResult.optimal_haplotypes`
+  完全一致——不重、不漏；
+- **不预存全部解**：每次调用内部至多保留 `batch_size + 1` 个候选，
+  通过"跳过已交付前缀"的剪枝从游标位置继续搜索；
+- **游标失效**：游标绑定 `loci`、`observations`、`batch_size` 的指纹，任一变化
+  后继续使用会抛 `InvalidPhasingInputError`；`max_nodes` 只是单次调用的安全
+  预算，不改变结果集合与顺序，因此换预算续取合法；
+- **预算语义**：`max_nodes` 覆盖单次调用的全部搜索（首批含最优性证明）。预算
+  耗尽时抛 `SearchBudgetExhaustedError`，不交付半成品批次，也不会把未完成的
+  枚举称为完毕。
+
 ### 错误语义
 
 - `InvalidPhasingInputError`（继承 `ValueError`）：违反契约即拒绝，错误信息
@@ -117,6 +161,10 @@ result = phase_haplotypes(
    全枚举，公式独立编写，不导入被测核心来产生期望值；120 个带固定种子的
    随机实例（含全缺失读段、非均匀权重）逐一核对最优值、全部最优解、严格次优、
    gap 与每读段归属。
+8. **分批领取**：`optimal_haplotype_batch` 首批以 `collect=False` 复用同一
+   分支界限只证明 `best/second`（不收集解集合），随后按字典序 DFS 枚举：
+   前缀下界 `> best` 整枝剪去，已交付的字典序前缀整体跳过，每批多取 1 个
+   候选用于判断是否还有后续，因此内部从不物化全部最优解。
 
 ## 输入上限（接口边界）
 
@@ -136,7 +184,10 @@ result = phase_haplotypes(
 - 目标是本题定义的“每读段分配给较低翻转代价者”的加权 MEC；不含覆盖度概率
   模型、读段质量分或重组/距离惩罚。
 - 分支界限为精确算法，最坏情况仍为指数级；上限 18 位是硬边界，超过即拒绝。
-- 全部最优解均物化返回；若位点重叠图高度碎裂，其数量可达 `2^17`。
+- `phase_haplotypes` 一次性物化全部最优解，若位点重叠图高度碎裂，其数量可达
+  `2^17`；需要控制内存时请改用 `optimal_haplotype_batch` 分批领取。
+- 分批游标是无状态令牌（不含服务端会话），每次续取会从搜索起点重放到游标
+  位置并剪去已交付前缀；受 18 位硬上限约束，单次重放最多约 `2^17` 个候选。
 
 ## 仓库结构
 
@@ -145,6 +196,7 @@ haplophase/__init__.py   # 公共导出
 haplophase/core.py       # 校验、分支界限、连通分量、结果组装
 tests/reference.py       # 独立全枚举参考（不调用被测核心求期望值）
 tests/test_phase.py      # 必要测试
+tests/test_batch.py      # 分批领取：顺序/不重不漏、游标失效、预算语义
 demo.py                  # 固定输入演示（正常结果 + 拒绝/异常边界）
 README.md
 ```
