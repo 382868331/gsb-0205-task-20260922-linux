@@ -13,7 +13,7 @@
 ## 准确命令
 
 ```bash
-# 必要测试（含 ≤10 位独立全枚举参考，120 个随机用例）
+# 必要测试（含 ≤10 位独立全枚举参考，120 个随机用例与分批领取测试）
 python -m unittest discover -s tests -v
 
 # 固定输入演示：一个正常定相结果 + 实际触发的输入拒绝 + 预算耗尽异常
@@ -58,6 +58,9 @@ result = phase_haplotypes(
 - `alleles`：list/tuple，长度必须等于 `loci`；元素仅允许 `0`、`1`、`None`；
 - `flip_cost`：正整数 `>= 1`；零、负数、float（含 `NaN`/`Infinity`）、`bool` 拒绝。
 
+分批领取接口 `phase_haplotypes_batched(loci, observations, *, batch_size, cursor=None, max_nodes=None)
+-> OptimalBatch` 见下文「分批领取最优解」。
+
 返回**冻结 dataclass** `PhasingResult`：
 
 | 字段 | 含义 |
@@ -95,6 +98,52 @@ result = phase_haplotypes(
   **可行但未证明最优**的在位解（其代价经精确计算）。
 - **预算耗尽 ≠ 证明无解**：本问题任何通过校验的实例都可行（候选空间有限且全部
   容许），不存在“无解”；预算异常只表示“未证完”。去掉 `max_nodes` 重跑即可。
+
+### 分批领取最优解（不一次性物化全部解）
+
+并列最优解可能多达 `2^17`，`phase_haplotypes` 会一次性物化它们；需要分批
+领取时使用有状态续取接口：
+
+```python
+from haplophase import phase_haplotypes_batched
+
+cursor = None
+while True:
+    out = phase_haplotypes_batched(
+        loci, observations,
+        batch_size=64,     # 正整数；bool 不接受；可逐批改变
+        cursor=cursor,     # 首轮传 None；之后传上一批返回的 cursor
+        max_nodes=None,    # 可选；只限制本次调用，不改变实例指纹
+    )
+    for h in out.haplotypes:   # 本批最优解（字典序稳定、互不重复）
+        ...
+    cursor = out.cursor
+    if out.exhausted:          # 仅当搜索真正走完最后一个候选时为 True
+        assert out.cursor is None
+        assert out.search.completed is True
+        break
+```
+
+契约要点：
+
+- **先证最优代价，再逐批列举**：每次调用都会独立重新证明 `optimal_cost`
+  （可采纳下界的分支界限），随后只列举代价恰好等于最优值的叶子；因此每个批次
+  返回的代价都是权威值，且内部从不预先保存全部最优解——续取令牌只保存挂起的
+  深度优先搜索位置（每个已展开深度的“下一待试分支 + 进入位”），内存为
+  `O(loci)`，任何时刻最多物化一个批次。
+- **不重复、不遗漏、顺序稳定**：枚举按字典序深度优先（每位先试 `0` 再试 `1`），
+  与 `PhasingResult.optimal_haplotypes` 的顺序完全一致；互补对称仍按原规则
+  通过固定 `h[0] = 0` 去重。所有批次拼接起来恰好等于
+  `phase_haplotypes(...).optimal_haplotypes`。`batch_size` 可以逐批改变。
+- **实例变化即令牌失效**：令牌绑定输入指纹（`loci` 与每条读段的 `alleles`、
+  `flip_cost` 的规范化表示）。输入变化后旧令牌被
+  `InvalidPhasingInputError` 拒绝，不会串到别的实例；伪造/损坏的令牌同样被
+  拒绝。`max_nodes` 是**每次调用**的工作量选项，不属于实例指纹：预算耗尽后
+  可以用同一个令牌去掉预算重试。
+- **预算语义**：预算在本次调用内覆盖“证优 + 列举”两段；耗尽时抛
+  `SearchBudgetExhaustedError`，不返回批次、不声称列举完毕，旧令牌仍可复用。
+  `OptimalBatch.search.completed` 与 `exhausted` 同义，列举未结束时永不为
+  `True`；最后一批可能是空批（搜索在此批内恰好走完），此时 `exhausted=True`。
 
 ## 算法与设计取舍
 
@@ -136,15 +185,17 @@ result = phase_haplotypes(
 - 目标是本题定义的“每读段分配给较低翻转代价者”的加权 MEC；不含覆盖度概率
   模型、读段质量分或重组/距离惩罚。
 - 分支界限为精确算法，最坏情况仍为指数级；上限 18 位是硬边界，超过即拒绝。
-- 全部最优解均物化返回；若位点重叠图高度碎裂，其数量可达 `2^17`。
+- `phase_haplotypes` 一次性物化全部最优解；若位点重叠图高度碎裂，其数量可达
+  `2^17`。需要控制内存时用 `phase_haplotypes_batched` 分批领取（续取令牌
+  只占 `O(loci)`，不预先保存全部最优解）。
 
 ## 仓库结构
 
 ```
 haplophase/__init__.py   # 公共导出
-haplophase/core.py       # 校验、分支界限、连通分量、结果组装
+haplophase/core.py       # 校验、分支界限、连通分量、结果组装、分批续取枚举
 tests/reference.py       # 独立全枚举参考（不调用被测核心求期望值）
-tests/test_phase.py      # 必要测试
-demo.py                  # 固定输入演示（正常结果 + 拒绝/异常边界）
+tests/test_phase.py      # 必要测试（含分批领取不重复/不遗漏/令牌失效测试）
+demo.py                  # 固定输入演示（正常结果 + 分批领取 + 拒绝/异常边界）
 README.md
 ```

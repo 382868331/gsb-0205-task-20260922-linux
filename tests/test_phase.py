@@ -9,12 +9,15 @@ import math
 import unittest
 
 from haplophase import (
+    EnumerationCursor,
     MAX_LOCI,
     MAX_OBSERVATIONS,
     InvalidPhasingInputError,
+    OptimalBatch,
     Observation,
     SearchBudgetExhaustedError,
     phase_haplotypes,
+    phase_haplotypes_batched,
 )
 
 from reference import (
@@ -347,3 +350,174 @@ class InputValidation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _collect_batched(loci, raw, batch_size, max_nodes=None):
+    batches = []
+    cursor = None
+    while True:
+        out = phase_haplotypes_batched(
+            loci,
+            to_obs(raw),
+            batch_size=batch_size,
+            cursor=cursor,
+            max_nodes=max_nodes,
+        )
+        self_is_exhausted = out.exhausted
+        assert self_is_exhausted == (out.cursor is None)
+        batches.append(out)
+        cursor = out.cursor
+        if out.exhausted:
+            assert out.search.completed is True
+            break
+        assert out.search.completed is False
+    return batches
+
+
+class BatchedEnumerationTests(unittest.TestCase):
+    def test_random_cases_batches_match_reference_without_gaps_or_repeats(self):
+        for loci, raw in random_cases():
+            best, optima, _second = brute_force(loci, raw)
+            for batch_size in (1, 2, 3, 7, 1000):
+                with self.subTest(loci=loci, batch_size=batch_size):
+                    batches = _collect_batched(loci, raw, batch_size)
+                    emitted = []
+                    cumulative = 0
+                    for out in batches:
+                        self.assertIsInstance(out, OptimalBatch)
+                        self.assertEqual(out.optimal_cost, best)
+                        self.assertLessEqual(len(out.haplotypes), batch_size)
+                        # stable order and no in-batch repeats
+                        self.assertEqual(
+                            out.haplotypes, tuple(sorted(out.haplotypes))
+                        )
+                        self.assertEqual(
+                            len(set(out.haplotypes)), len(out.haplotypes)
+                        )
+                        for h in out.haplotypes:
+                            self.assertEqual(h[0], 0)
+                            self.assertEqual(reference_cost(h, raw), best)
+                        emitted.extend(out.haplotypes)
+                        cumulative += len(out.haplotypes)
+                        self.assertEqual(out.emitted_total, cumulative)
+                    # disjoint batches, no omissions, global stable order
+                    self.assertEqual(tuple(emitted), optima)
+                    self.assertEqual(len(set(emitted)), len(emitted))
+
+    def test_no_reads_all_2_pow_l_minus_1_optima_across_tiny_batches(self):
+        loci = 8
+        batches = _collect_batched(loci, [], 3)
+        self.assertEqual(sum(len(b.haplotypes) for b in batches), 128)
+        # the last batch must be the only one reporting exhaustion
+        self.assertTrue(all(not b.exhausted for b in batches[:-1]))
+        self.assertTrue(batches[-1].exhausted)
+
+    def test_batch_size_may_change_between_calls(self):
+        loci = 6
+        raw = [
+            ((0, 1, None, None, None, None), 1),
+            ((None, None, 0, 1, None, None), 1),
+            ((None, None, None, None, 0, 1), 1),
+        ]
+        _best, optima, _second = brute_force(loci, raw)
+        collected = []
+        cursor = None
+        for size in (2, 5, 1, 4):
+            out = phase_haplotypes_batched(
+                loci, to_obs(raw), batch_size=size, cursor=cursor
+            )
+            collected.extend(out.haplotypes)
+            cursor = out.cursor
+            if out.exhausted:
+                break
+        self.assertEqual(tuple(collected), optima)
+
+    def test_cursor_is_rejected_after_inputs_or_options_change(self):
+        loci = 4
+        # three free components (one unlinked locus, two disconnected reads)
+        raw = [
+            ((0, 1, None, None), 1),
+            ((None, None, 0, None), 1),
+            ((None, None, None, 0), 1),
+        ]
+        _best, optima, _second = brute_force(loci, raw)
+        self.assertGreater(len(optima), 1)
+        first = phase_haplotypes_batched(loci, to_obs(raw), batch_size=1)
+        self.assertIsNotNone(first.cursor)
+        # an observation changed (added read)
+        with self.assertRaises(InvalidPhasingInputError) as ctx:
+            phase_haplotypes_batched(
+                loci,
+                to_obs(raw) + [Observation((0, 0, 0, 0), 1)],
+                batch_size=1,
+                cursor=first.cursor,
+            )
+        self.assertIn("cursor", str(ctx.exception))
+        # max_nodes is a per-call effort option, not part of the instance:
+        # it never invalidates an otherwise valid cursor
+        with_budget = phase_haplotypes_batched(
+            loci,
+            to_obs(raw),
+            batch_size=1,
+            cursor=first.cursor,
+            max_nodes=10_000,
+        )
+        self.assertEqual(with_budget.emitted_total, 2)
+        again = phase_haplotypes_batched(
+            loci, to_obs(raw), batch_size=1, cursor=first.cursor
+        )
+        self.assertEqual(again.emitted_total, 2)
+        self.assertFalse(again.exhausted)
+        # and the continuation can be drained to the full reference set
+        collected = list(first.haplotypes) + list(again.haplotypes)
+        cursor = again.cursor
+        while cursor is not None:
+            out = phase_haplotypes_batched(
+                loci, to_obs(raw), batch_size=1, cursor=cursor
+            )
+            collected.extend(out.haplotypes)
+            cursor = out.cursor
+        self.assertEqual(tuple(collected), optima)
+
+    def test_foreign_or_malformed_cursor_is_rejected(self):
+        loci = 4
+        raw = [((0, 1, None, None), 1), ((None, None, 0, 1), 1)]
+        good = phase_haplotypes_batched(loci, to_obs(raw), batch_size=1)
+        cases = [
+            "not-a-cursor",
+            EnumerationCursor(good.cursor.fingerprint, (5,), (), 0),
+            EnumerationCursor(good.cursor.fingerprint, (1, 2), (0,), 0),
+            EnumerationCursor("deadbeef", (1, 0), (0, 1), 0),
+            EnumerationCursor(good.cursor.fingerprint, (1, 0), (0, 0), -1),
+        ]
+        for bad in cases:
+            with self.subTest(bad=bad):
+                with self.assertRaises(InvalidPhasingInputError):
+                    phase_haplotypes_batched(
+                        loci, to_obs(raw), batch_size=1, cursor=bad
+                    )
+
+    def test_batch_size_contract(self):
+        loci = 2
+        obs = [Observation((0, 0), 1)]
+        for bad in (0, -1, True, 1.0, "2", None):
+            with self.subTest(bad=bad):
+                with self.assertRaises(InvalidPhasingInputError):
+                    phase_haplotypes_batched(loci, obs, batch_size=bad)
+
+    def test_budget_exhaustion_does_not_report_completion_or_emit_claims(self):
+        loci = 8
+        from itertools import product
+        all_candidates = tuple((0,) + c for c in product((0, 1), repeat=loci - 1))
+        out = phase_haplotypes_batched(loci, [], batch_size=3)
+        with self.assertRaises(SearchBudgetExhaustedError):
+            phase_haplotypes_batched(
+                loci, [], batch_size=3, cursor=out.cursor, max_nodes=2
+            )
+        # the unconsumed cursor stays usable once the budget is removed
+        again = phase_haplotypes_batched(
+            loci, [], batch_size=3, cursor=out.cursor
+        )
+        # no overlap: the retry continues strictly after the prior batch
+        self.assertNotIn(again.haplotypes[0], out.haplotypes)
+        self.assertEqual(again.haplotypes[0], tuple(sorted(all_candidates)[3]))

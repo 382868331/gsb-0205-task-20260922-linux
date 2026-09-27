@@ -7,27 +7,33 @@ and bound. See ``haplophase.core`` for the full contract.
 from .core import (
     MAX_LOCI,
     MAX_OBSERVATIONS,
+    EnumerationCursor,
     InvalidPhasingInputError,
     Observation,
+    OptimalBatch,
     PhasingError,
     PhasingResult,
     ReadAssignment,
     SearchBudgetExhaustedError,
     SearchStats,
     phase_haplotypes,
+    phase_haplotypes_batched,
 )
 
 __all__ = [
     "MAX_LOCI",
     "MAX_OBSERVATIONS",
+    "EnumerationCursor",
     "InvalidPhasingInputError",
     "Observation",
+    "OptimalBatch",
     "PhasingError",
     "PhasingResult",
     "ReadAssignment",
     "SearchBudgetExhaustedError",
     "SearchStats",
     "phase_haplotypes",
+    "phase_haplotypes_batched",
 ]
 
 __version__ = "1.0.0"

@@ -24,6 +24,7 @@ from haplophase import (
     Observation,
     SearchBudgetExhaustedError,
     phase_haplotypes,
+    phase_haplotypes_batched,
 )
 
 
@@ -132,6 +133,53 @@ def main() -> None:
     dt = time.perf_counter() - t0
     show_result(result_b)
     print(f"computed in {dt * 1000:.1f} ms over a space of 2**14 candidates")
+
+    # ------------------------------------------------------------------ B2
+    show("B2. Batched enumeration of tied optima (fetch 3 per continuation)")
+    # Three reads on disjoint locus pairs: the pair containing locus 0 has a
+    # fixed orientation, the other two are free components, so there are
+    # exactly 4 optima (fetched 3 per continuation -> a partial final batch).
+    linked_reads = [
+        Observation((0, 1, None, None, None, None), 1),
+        Observation((None, None, 0, 1, None, None), 1),
+        Observation((None, None, None, None, 0, 1), 1),
+    ]
+    cursor = None
+    collected = []
+    batch_no = 0
+    while True:
+        batch_no += 1
+        out = phase_haplotypes_batched(
+            6, linked_reads, batch_size=3, cursor=cursor
+        )
+        labels = ", ".join("".join(map(str, h)) for h in out.haplotypes) or "-"
+        print(
+            f"  batch {batch_no}: [{labels}]  proven optimal cost "
+            f"{out.optimal_cost}, emitted so far {out.emitted_total}, "
+            f"search completed = {out.search.completed}"
+        )
+        collected.extend(out.haplotypes)
+        cursor = out.cursor
+        if out.exhausted:
+            break
+    batched_check = phase_haplotypes(6, linked_reads)
+    assert tuple(collected) == batched_check.optimal_haplotypes
+    print(
+        "  exhausted is reported only after the last candidate was visited; "
+        "no batch ever holds more than batch_size solutions."
+    )
+    show("B3. Continuation invalidation: changed inputs reject the old cursor")
+    first_batch = phase_haplotypes_batched(6, linked_reads, batch_size=2)
+    changed = linked_reads + [
+        Observation((0, 0, 0, 0, 0, 0), 7),
+    ]
+    try:
+        phase_haplotypes_batched(
+            6, changed, batch_size=2, cursor=first_batch.cursor
+        )
+    except InvalidPhasingInputError as err:
+        print(f"raised {type(err).__name__}: {err}")
+    print("  restart with cursor=None to enumerate the new instance.")
 
     # ------------------------------------------------------------------ C
     show("C1. Rejected boundary: NaN allele (locatable error, no silent fix)")
